@@ -103,17 +103,28 @@ impl LlmConfig {
     }
 }
 
+/// Largest `i <= index` that is a UTF-8 char boundary in `s`.
+/// (`str::floor_char_boundary` is only stable since Rust 1.91; the
+/// workspace MSRV is 1.88, so this manual loop keeps CI green.)
+fn floor_boundary(s: &str, index: usize) -> usize {
+    let mut i = index.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// Truncate `s` to at most `max_len` bytes without splitting a UTF-8
 /// code point (`String::truncate` panics otherwise).
 fn truncate_chars(s: &mut String, max_len: usize) {
     if s.len() > max_len {
-        s.truncate(s.floor_char_boundary(max_len));
+        s.truncate(floor_boundary(s, max_len));
     }
 }
 
 /// Byte prefix of `s` limited to `max_len` bytes on a char boundary.
 fn char_prefix(s: &str, max_len: usize) -> &str {
-    &s[..s.floor_char_boundary(max_len.min(s.len()))]
+    &s[..floor_boundary(s, max_len.min(s.len()))]
 }
 
 /// One staged file + its staged (index vs HEAD) diff, truncated for prompt.

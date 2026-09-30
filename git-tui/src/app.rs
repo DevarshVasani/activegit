@@ -4216,7 +4216,8 @@ mod tests {
     }
 
     #[test]
-    fn enter_esc_then_walk_files_in_both_directions() {        let mut fx = harness(&["a.txt", "b.txt", "c.txt"]);
+    fn enter_esc_then_walk_files_in_both_directions() {
+        let mut fx = harness(&["a.txt", "b.txt", "c.txt"]);
         fx.app.on_key(KeyCode::Enter);
         assert_eq!(fx.app.mode(), Mode::FullDiff);
         fx.app.on_key(KeyCode::Esc);

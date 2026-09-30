@@ -2428,8 +2428,13 @@ fn render_open_browser_modal(
     if let Some(err) = browser.error.as_deref() {
         let mut text = err.to_string();
         if text.len() > inner_w {
-            let max = inner_w.saturating_sub(1);
-            text.truncate(text.floor_char_boundary(max.min(text.len())));
+            // Back off to a char boundary without `floor_char_boundary`
+            // (stable since 1.91; MSRV is 1.88).
+            let mut max = inner_w.saturating_sub(1).min(text.len());
+            while !text.is_char_boundary(max) {
+                max -= 1;
+            }
+            text.truncate(max);
         }
         lines.push(Line::from(vec![Span::styled(
             text,

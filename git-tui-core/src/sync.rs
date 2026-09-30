@@ -185,7 +185,13 @@ fn run_git(workdir: &Path, args: &[&str]) -> Result<String, GitError> {
             msg = format!("git {} failed with no output", args.join(" "));
         }
         if msg.len() > 400 {
-            msg.truncate(msg.floor_char_boundary(400));
+            // Back off to a char boundary without `floor_char_boundary`
+            // (stable since 1.91; MSRV is 1.88).
+            let mut i = 400;
+            while !msg.is_char_boundary(i) {
+                i -= 1;
+            }
+            msg.truncate(i);
         }
         return Err(GitError::Sync(msg));
     }
