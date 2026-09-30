@@ -181,6 +181,12 @@ pub struct App {
     md_for: Option<(String, bool)>,
     /// Full new-version text for the Markdown preview.
     md_text: Option<String>,
+    /// A mutation just landed; the [5] diff preview (and Markdown) waits
+    /// for the fresh status before reloading. Reloading the old
+    /// `diff_for` immediately (e.g. stash push/pop) flashes stale content
+    /// — a whole-file view instead of hunks or vice versa — and costs an
+    /// extra worker roundtrip.
+    pending_diff_reload: bool,
 }
 
 /// Nvim-style visual selection: charwise (`v`) or linewise (`V`).
@@ -476,6 +482,7 @@ impl App {
             markdown_preview: false,
             md_for: None,
             md_text: None,
+            pending_diff_reload: false,
         };
         app.refresh();
         app.preload_panels();
@@ -2422,9 +2429,30 @@ impl App {
         }
     }
 
-    fn reload_diff(&mut self) {
-        if let Some((path, staged)) = self.diff_for.clone() {
-            let job = if self.diff_whole_file {
+    /// Reload the [5] diff preview from the *fresh* status after a
+    /// mutation (stash push/pop, stage, commit, …). It recomputes the
+    /// target (path, staged flag, whole-file vs diff) instead of
+    /// re-requesting a stale `diff_for`, so a stash that cleans the tree
+    /// shows the whole file and a pop shows the restored hunks — no flash
+    /// of wrong content, no wasted worker roundtrip.
+    fn force_reload_diff_for_fresh_status(&mut self) {
+        let target = self.diff_target();
+        let path_changed =
+            target.as_ref().map(|(p, _)| p) != self.diff_for.as_ref().map(|(p, _)| p);
+        if path_changed {
+            self.fallback_whole_file = false;
+        }
+        let whole = self.selected_is_clean() || self.fallback_whole_file;
+        self.diff_for = target.clone();
+        // Stale view: show loading until the fresh diff arrives.
+        self.set_diff(None);
+        self.hunk = 0;
+        self.cursor = 0;
+        self.cursor_col = 0;
+        self.diff_scroll = 0;
+        self.diff_whole_file = whole;
+        if let Some((path, staged)) = target {
+            let job = if whole {
                 AsyncJob::LoadFile { path }
             } else {
                 AsyncJob::LoadDiff { path, staged }
@@ -2433,14 +2461,7 @@ impl App {
                 self.error = Some(e.to_string());
             }
         }
-        self.reload_markdown();
-    }
-
-    /// Re-request Markdown text after a mutation (stage/commit/…).
-    fn reload_markdown(&mut self) {
-        if !self.show_markdown_preview() {
-            return;
-        }
+        // Markdown follows the same fresh target.
         self.md_for = None;
         self.md_text = None;
         self.maybe_load_markdown();
@@ -2765,8 +2786,13 @@ impl App {
         while let Some(result) = self.queue.try_recv() {
             self.apply(result);
         }
-        self.maybe_load_diff();
-        self.maybe_load_markdown();
+        // After a mutation the [5] preview waits for the fresh status
+        // (see `pending_diff_reload`): loading the old target now would
+        // flash stale content and waste a worker roundtrip.
+        if !self.pending_diff_reload {
+            self.maybe_load_diff();
+            self.maybe_load_markdown();
+        }
     }
 
     fn apply(&mut self, result: AsyncResult) {
@@ -2775,6 +2801,10 @@ impl App {
                 self.status = Some(st);
                 self.rebuild_file_list();
                 self.error = None;
+                if self.pending_diff_reload {
+                    self.pending_diff_reload = false;
+                    self.force_reload_diff_for_fresh_status();
+                }
             }
             AsyncResult::Diff(d) => {
                 // Drop overtaken loads: only the latest target counts
@@ -2845,7 +2875,17 @@ impl App {
             AsyncResult::MutationDone => {
                 self.syncing = None;
                 self.refresh();
-                self.reload_diff();
+                // Defer the [5] preview (+ Markdown) until the fresh
+                // status lands: stash push/pop changes the target itself
+                // (clean <-> dirty, whole-file <-> hunks). Show loading
+                // now so stale hunks never linger.
+                self.pending_diff_reload = true;
+                self.set_diff(None);
+                self.hunk = 0;
+                self.cursor = 0;
+                self.cursor_col = 0;
+                self.diff_scroll = 0;
+                self.md_text = None;
                 self.reload_branches();
                 self.reload_log();
                 self.reload_stash();
@@ -2854,6 +2894,10 @@ impl App {
             AsyncResult::Error(e) => {
                 self.syncing = None;
                 self.generating = false;
+                // A failed mutation leaves status unchanged: drop the
+                // deferred reload so the preview recovers via the normal
+                // `maybe_load_diff` path on the next poll.
+                self.pending_diff_reload = false;
                 // EmptyCommit on its own doesn't say how to fix it.
                 self.error = Some(match e {
                     GitError::EmptyCommit => {
@@ -4127,8 +4171,52 @@ mod tests {
     }
 
     #[test]
-    fn enter_esc_then_walk_files_in_both_directions() {
-        let mut fx = harness(&["a.txt", "b.txt", "c.txt"]);
+    fn force_reload_recomputes_target_from_fresh_status() {
+        // Stash push cleans the tree (whole-file view); pop dirties it
+        // again (hunks). The [5] preview must follow the fresh status,
+        // not re-request the stale `diff_for`.
+        use git_tui_core::status::{RepoStatus, StatusEntry};
+        let mut fx = harness(&["a.txt"]);
+        wait_for_diff(&mut fx.app, "a.txt");
+        // Fresh status: tree clean -> whole-file view for the same path.
+        fx.app.status = Some(RepoStatus {
+            branch: "main".into(),
+            head_summary: "x".into(),
+            files: vec![],
+            tracked_files: vec!["a.txt".into()],
+        });
+        fx.app.rebuild_file_list();
+        fx.app.force_reload_diff_for_fresh_status();
+        assert_eq!(
+            fx.app.diff_for,
+            Some(("a.txt".to_string(), false)),
+            "target must be recomputed, got {:?}",
+            fx.app.diff_for
+        );
+        assert!(
+            fx.app.diff_whole_file(),
+            "clean tree must show the whole file, not hunks"
+        );
+        // Fresh status: dirty again -> real diff with hunks.
+        fx.app.status = Some(RepoStatus {
+            branch: "main".into(),
+            head_summary: "x".into(),
+            files: vec![StatusEntry {
+                path: "a.txt".into(),
+                state: FileState::Unstaged,
+            }],
+            tracked_files: vec!["a.txt".into()],
+        });
+        fx.app.rebuild_file_list();
+        fx.app.force_reload_diff_for_fresh_status();
+        assert!(
+            !fx.app.diff_whole_file(),
+            "dirty tree must show the diff, not the whole file"
+        );
+    }
+
+    #[test]
+    fn enter_esc_then_walk_files_in_both_directions() {        let mut fx = harness(&["a.txt", "b.txt", "c.txt"]);
         fx.app.on_key(KeyCode::Enter);
         assert_eq!(fx.app.mode(), Mode::FullDiff);
         fx.app.on_key(KeyCode::Esc);

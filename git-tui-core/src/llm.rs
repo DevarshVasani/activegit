@@ -103,6 +103,19 @@ impl LlmConfig {
     }
 }
 
+/// Truncate `s` to at most `max_len` bytes without splitting a UTF-8
+/// code point (`String::truncate` panics otherwise).
+fn truncate_chars(s: &mut String, max_len: usize) {
+    if s.len() > max_len {
+        s.truncate(s.floor_char_boundary(max_len));
+    }
+}
+
+/// Byte prefix of `s` limited to `max_len` bytes on a char boundary.
+fn char_prefix(s: &str, max_len: usize) -> &str {
+    &s[..s.floor_char_boundary(max_len.min(s.len()))]
+}
+
 /// One staged file + its staged (index vs HEAD) diff, truncated for prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedFile {
@@ -138,7 +151,7 @@ pub fn staged_context(repo: &git2::Repository) -> Result<Vec<StagedFile>, GitErr
             render_unified(&diff)
         };
         if unified.len() > MAX_FILE_CHARS {
-            unified.truncate(MAX_FILE_CHARS);
+            truncate_chars(&mut unified, MAX_FILE_CHARS);
             unified.push_str("\n…(truncated)");
         }
         let status_label = match entry.state {
@@ -235,7 +248,8 @@ pub fn build_commit_prompt(files: &[StagedFile]) -> String {
             s.push_str(&f.unified);
             total += f.unified.len();
         } else {
-            s.push_str(&f.unified[..remaining]);
+            let prefix = char_prefix(&f.unified, remaining);
+            s.push_str(prefix);
             s.push_str("\n…(truncated)\n");
             total = MAX_TOTAL_CHARS;
         }
@@ -316,7 +330,7 @@ pub fn clean_message(raw: &str) -> String {
     let kept: Vec<&str> = lines.into_iter().take(11).collect();
     let mut out = kept.join("\n").trim().to_string();
     if out.len() > 1000 {
-        out.truncate(1000);
+        truncate_chars(&mut out, 1000);
         out.push('…');
     }
     out
@@ -599,6 +613,30 @@ mod tests {
     fn cleaner_strips_fences() {
         assert_eq!(clean_message("```\nfeat: x\n```"), "feat: x");
         assert_eq!(clean_message("  fix: y  "), "fix: y");
+    }
+
+    #[test]
+    fn truncation_never_splits_utf8() {
+        // `truncate_chars` at a mid-code-point index must back off, not panic.
+        let mut s = "a".repeat(3999) + "érest";
+        truncate_chars(&mut s, MAX_FILE_CHARS);
+        assert!(s.len() <= MAX_FILE_CHARS);
+        assert!(s.is_char_boundary(s.len()));
+
+        // `build_commit_prompt` slicing a multi-byte diff must not panic.
+        let files = vec![StagedFile {
+            path: "emoji.txt".into(),
+            status_label: "staged".into(),
+            unified: "é".repeat(20_000),
+            added: 1,
+            removed: 0,
+        }];
+        let p = build_commit_prompt(&files);
+        assert!(p.contains("emoji.txt"));
+
+        // `clean_message` truncation of multi-byte text must not panic.
+        let m = clean_message(&"é".repeat(2000));
+        assert!(m.len() <= 1000 + "…".len());
     }
 
     #[test]

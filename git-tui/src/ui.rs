@@ -2428,7 +2428,8 @@ fn render_open_browser_modal(
     if let Some(err) = browser.error.as_deref() {
         let mut text = err.to_string();
         if text.len() > inner_w {
-            text.truncate(inner_w.saturating_sub(1));
+            let max = inner_w.saturating_sub(1);
+            text.truncate(text.floor_char_boundary(max.min(text.len())));
         }
         lines.push(Line::from(vec![Span::styled(
             text,

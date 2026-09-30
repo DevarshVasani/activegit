@@ -185,7 +185,7 @@ fn run_git(workdir: &Path, args: &[&str]) -> Result<String, GitError> {
             msg = format!("git {} failed with no output", args.join(" "));
         }
         if msg.len() > 400 {
-            msg.truncate(400);
+            msg.truncate(msg.floor_char_boundary(400));
         }
         return Err(GitError::Sync(msg));
     }
