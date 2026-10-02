@@ -1,14 +1,14 @@
-# Contributing to AgentGit
+# Contributing to ActiveGit
 
-Thanks for your interest in improving AgentGit! Bug reports, feature ideas,
+Thanks for your interest in improving ActiveGit! Bug reports, feature ideas,
 docs fixes, and pull requests are all welcome.
 
 ## Reporting bugs and requesting features
 
-Open an [issue](https://github.com/DevarshVasani/AgentGit/issues). For bugs,
+Open an [issue](https://github.com/DevarshVasani/activegit/issues). For bugs,
 please include:
 
-- your OS, terminal, and `agentgit --version`
+- your OS, terminal, and `activegit --version`
 - what you did, what you expected, and what happened
 - a screenshot or recording for rendering problems
 
@@ -20,7 +20,7 @@ before you spend time on code.
 | Crate           | Purpose                                                                       |
 | --------------- | ----------------------------------------------------------------------------- |
 | `git-tui-core`  | UI-independent git logic (libgit2, sync, LLM commit messages, job queue)      |
-| `git-tui`       | The `agentgit` binary: ratatui UI, key handling, config, session, themes      |
+| `git-tui`       | The `activegit` binary: ratatui UI, key handling, config, session, themes      |
 
 Keep git and LLM logic in `git-tui-core` and rendering/input in `git-tui`, so
 the core stays testable without a terminal.
@@ -30,8 +30,8 @@ the core stays testable without a terminal.
 You need Rust 1.88+ and a `git` CLI on your `PATH`.
 
 ```sh
-git clone https://github.com/DevarshVasani/AgentGit && cd AgentGit
-cargo run -p agentgit -- .    # run against this repo
+git clone https://github.com/DevarshVasani/activegit && cd activegit
+cargo run -p activegit -- .    # run against this repo
 ```
 
 Before opening a pull request, make sure the same checks CI runs pass:

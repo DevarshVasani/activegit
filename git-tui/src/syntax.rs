@@ -210,8 +210,8 @@ const HIGHLIGHT_LEN_CAP: usize = 2000;
 fn syntect_theme(theme: Theme) -> SynTheme {
     let fg = rat_to_syn(theme.fg);
     SynTheme {
-        name: Some("agentgit-lazyvim".into()),
-        author: Some("agentgit".into()),
+        name: Some("activegit-lazyvim".into()),
+        author: Some("activegit".into()),
         settings: ThemeSettings {
             foreground: Some(fg),
             background: None,

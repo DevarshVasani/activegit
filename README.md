@@ -1,6 +1,6 @@
 <div align="center">
 
-# AgentGit
+# ActiveGit
 
 **A fast, keyboard-driven git TUI with AI commit messages**
 
@@ -14,11 +14,11 @@ Status → diff → stage → commit, without leaving the terminal.
 
 <br>
 
-<img src="docs/screenshots/hero.png" alt="agentgit main view: project tabs, file tree with staged, modified and untracked files, and a syntax-highlighted inline diff" width="100%">
+<img src="docs/screenshots/hero.png" alt="activegit main view: project tabs, file tree with staged, modified and untracked files, and a syntax-highlighted inline diff" width="100%">
 
 </div>
 
-## Why AgentGit?
+## Why ActiveGit?
 
 A commit-workflow TUI that stays out of your way. Inspect status, review
 side-by-side diffs, stage whole files **or single hunks**, and commit,
@@ -82,18 +82,18 @@ Prebuilt binaries for **Linux** and **macOS** (x86_64 and ARM64). You also need 
 **Shell installer**
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/DevarshVasani/AgentGit/releases/latest/download/agentgit-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/DevarshVasani/activegit/releases/latest/download/activegit-installer.sh | sh
 ```
 
 **mise**
 
 ```sh
-mise use -g github:DevarshVasani/AgentGit
+mise use -g github:DevarshVasani/activegit
 ```
 
 **Manual download:** grab the archive for your platform from the
-[latest release](https://github.com/DevarshVasani/AgentGit/releases/latest),
-unpack it, and put `agentgit` somewhere on your `PATH`.
+[latest release](https://github.com/DevarshVasani/activegit/releases/latest),
+unpack it, and put `activegit` somewhere on your `PATH`.
 
 <details>
 <summary><b>Build from source</b> (Rust 1.88+)</summary>
@@ -101,27 +101,27 @@ unpack it, and put `agentgit` somewhere on your `PATH`.
 <br>
 
 ```sh
-cargo install --locked --git https://github.com/DevarshVasani/AgentGit agentgit
+cargo install --locked --git https://github.com/DevarshVasani/activegit activegit
 # or from a local checkout:
-git clone https://github.com/DevarshVasani/AgentGit && cd AgentGit
+git clone https://github.com/DevarshVasani/activegit && cd activegit
 cargo install --locked --path git-tui
 ```
 
-Both install `agentgit` into `~/.cargo/bin`; make sure that's on your `PATH`.
+Both install `activegit` into `~/.cargo/bin`; make sure that's on your `PATH`.
 
 </details>
 
 ## Quick start
 
 ```sh
-agentgit                                    # repo in the current directory
-agentgit ~/projects/api ~/projects/web      # several repos as tabs
-agentgit --repo ~/projects/api --theme tokyo-night
-agentgit --version
+activegit                                    # repo in the current directory
+activegit ~/projects/api ~/projects/web      # several repos as tabs
+activegit --repo ~/projects/api --theme tokyo-night
+activegit --version
 ```
 
 ```text
-usage: agentgit [--theme <default|tokyo-night|catppuccin|legacy>]
+usage: activegit [--theme <default|tokyo-night|catppuccin|legacy>]
                 [--repo <path>]... [<path>...] [-- <path>...]
 ```
 
@@ -181,8 +181,8 @@ scroll for long lines.
 ## Multiple projects
 
 ```sh
-agentgit ~/projects/api ~/projects/web
-agentgit --repo ~/projects/api --repo ~/projects/web
+activegit ~/projects/api ~/projects/web
+activegit --repo ~/projects/api --repo ~/projects/web
 ```
 
 Each tab keeps its own status, diff, selection, and staging state. The
@@ -208,8 +208,8 @@ credentials fail fast instead of hanging.
 
 ## Configuration
 
-Config lives in `~/.config/agentgit/config.toml` (or
-`$XDG_CONFIG_HOME/agentgit/config.toml`). A missing file means defaults;
+Config lives in `~/.config/activegit/config.toml` (or
+`$XDG_CONFIG_HOME/activegit/config.toml`). A missing file means defaults;
 unknown actions, keys, or sections fail fast and name the offending value.
 
 ```toml
@@ -268,13 +268,13 @@ sync_pull  sync_push  llm_settings  toggle_markdown_preview
 </details>
 
 <details>
-<summary><b>Upgrading from git-tui</b></summary>
+<summary><b>Upgrading from agentgit / git-tui</b></summary>
 
 <br>
 
-AgentGit was previously called `git-tui`. If `~/.config/git-tui/` exists and
-`~/.config/agentgit/` does not, the old directory keeps being used, so your
-config and session carry over. Move it to `~/.config/agentgit/` whenever you like.
+ActiveGit was previously called `agentgit` (and `git-tui` before that).
+Config and session now live in `~/.config/activegit/`; move your old
+`~/.config/agentgit/` (or `~/.config/git-tui/`) files there to carry them over.
 
 </details>
 
@@ -283,15 +283,15 @@ config and session carry over. Move it to `~/.config/agentgit/` whenever you lik
 | Crate                       | Role                                                                                                                                            |
 | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | **`git-tui-core`**          | All git operations + a single-writer async job engine (no TUI deps). Owns git state; only owned data crosses the job channel. Typed `GitError`. |
-| **`agentgit`** (`git-tui/`) | ratatui frontend: panels, side-by-side diff, modals, theming. `anyhow` at the edge.                                                             |
+| **`activegit`** (`git-tui/`) | ratatui frontend: panels, side-by-side diff, modals, theming. `anyhow` at the edge.                                                             |
 
 No tokio or async-std: a background worker thread owns the `Repo` and
 talks to the UI over a `crossbeam-channel`, so the UI never blocks on git.
 
 ```text
-AgentGit/
+activegit/
 ├── git-tui-core/   # lib: repo · status · diff · stage · commit · branch · log · stash · sync · llm · jobqueue · error
-└── git-tui/        # bin `agentgit`: main · app · ui · workspace · config · syntax · markdown · session · fuzzy · words
+└── git-tui/        # bin `activegit`: main · app · ui · workspace · config · syntax · markdown · session · fuzzy · words
 ```
 
 ## Development
@@ -310,7 +310,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
 Releases are built by [cargo-dist](https://github.com/axodotdev/cargo-dist)
 (`.github/workflows/release.yml`, config in `dist-workspace.toml`). Pushing a
 version tag builds every target, then publishes the archives, checksums, and
-`agentgit-installer.sh` to a GitHub Release:
+`activegit-installer.sh` to a GitHub Release:
 
 ```sh
 # bump [workspace.package] version in Cargo.toml, commit, then:

@@ -1,0 +1,24 @@
+[package]
+name = "activegit-bench"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "activegit-bench"
+path = "src/main.rs"
+
+[dependencies]
+git-tui-core = { path = "../git-tui-core" }
+anyhow = "1"
+crossterm = "0.28"
+ratatui = "0.29"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "0.9.6"
+unicode-width = "0.1"
+similar = "2.7.0"
+syntect = { version = "5.2", default-features = false, features = ["default-syntaxes", "default-themes", "parsing", "regex-onig"] }
+pulldown-cmark = { version = "0.12", default-features = false, features = ["simd"] }
+git2 = { version = "0.19", features = ["vendored-libgit2", "vendored-openssl"] }
+tempfile = "3"

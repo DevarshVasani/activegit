@@ -4,6 +4,7 @@ use crate::app::{App, Focus, Mode, VisualSel, LLM_FIELD_LABELS};
 use crate::config::Theme;
 use crate::markdown::render_markdown;
 use crate::syntax::{highlight_line, HiToken};
+use crate::welcome::{WELCOME_FEATURES, WELCOME_KEYS};
 use crate::words::{word_diff, WordSeg};
 use crate::workspace::Workspace;
 use git_tui_core::branch::BranchInfo;
@@ -14,7 +15,9 @@ use git_tui_core::status::{FileState, StatusEntry};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
@@ -311,6 +314,9 @@ pub fn render_workspace(frame: &mut Frame, ws: &Workspace) {
     let area = frame.area();
     if ws.len() <= 1 {
         render(frame, ws.current());
+        if ws.welcome_visible() {
+            render_welcome_modal(frame, area, ws.theme());
+        }
         return;
     }
     let theme = ws.theme();
@@ -366,6 +372,9 @@ pub fn render_workspace(frame: &mut Frame, ws: &Workspace) {
         // The project bar stays on screen; only the body goes fullscreen.
         Mode::FullDiff => render_fullscreen_diff(frame, body, app),
         Mode::Normal => {}
+    }
+    if ws.welcome_visible() {
+        render_welcome_modal(frame, area, ws.theme());
     }
 }
 
@@ -2558,6 +2567,54 @@ fn render_confirm_init_modal(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
+/// First-run welcome overlay: what activegit is, its features, and the
+/// keybindings to start with. Dismissed with enter/esc/q (see the hint).
+fn render_welcome_modal(frame: &mut Frame, area: Rect, theme: Theme) {
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::styled(
+            "A fast, keyboard-driven git TUI with AI commit messages",
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+    ];
+    for feature in WELCOME_FEATURES {
+        lines.push(Line::from(vec![
+            Span::styled("· ", Style::default().fg(theme.border_focused)),
+            Span::styled((*feature).to_string(), Style::default().fg(theme.fg)),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    for (keys, action) in WELCOME_KEYS {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {keys:<9}"),
+                Style::default()
+                    .fg(theme.branch_current)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled((*action).to_string(), Style::default().fg(theme.fg)),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![Span::styled(
+        "enter / esc: start · o: open a project · q: dismiss",
+        Style::default().fg(theme.hint),
+    )]));
+    let popup = centered_rect(area, 76, lines.len() as u16 + 2);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(panel_block(
+                true,
+                theme,
+                " Welcome to activegit ".to_string(),
+            ))
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
 fn branch_list_items(branches: &[BranchInfo], theme: Theme) -> Vec<ListItem<'static>> {
     branches
         .iter()
@@ -2800,6 +2857,41 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    fn wscreen(ws: &Workspace, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_workspace(f, ws)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn welcome_overlay_introduces_activegit_and_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        let mut ws = Workspace::open(vec![dir.path().to_path_buf()], Config::default()).unwrap();
+        // Hidden by default: the normal UI shows, no intro.
+        assert!(
+            !wscreen(&ws, 100, 32).contains("Welcome to activegit"),
+            "welcome leaked into normal render"
+        );
+        ws.set_show_welcome(true);
+        let s = wscreen(&ws, 100, 32);
+        assert!(s.contains("Welcome to activegit"), "title missing:\n{s}");
+        assert!(s.contains("activegit"), "product name missing:\n{s}");
+        for key in ["j / k", "enter", "space", "Shift+A", "q / Q"] {
+            assert!(s.contains(key), "key {key} missing:\n{s}");
+        }
+        assert!(s.contains("open a project"), "dismiss hint missing:\n{s}");
     }
     #[test]
     fn renders_file_list_with_branch_and_selection() {

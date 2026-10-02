@@ -1,6 +1,6 @@
 //! Phase 5: TOML config — keybinding overrides and theme selection.
 //!
-//! `~/.config/agentgit/config.toml`. Missing file means defaults; anything
+//! `~/.config/activegit/config.toml`. Missing file means defaults; anything
 //! present overrides just that piece. Invalid names fail fast with the file
 //! path and the offending value.
 
@@ -320,19 +320,16 @@ pub struct Config {
     pub keys: KeyBindings,
     pub theme: Theme,
     /// LLM provider for Shift+A commit generation in the commit box.
-    /// `~/.config/agentgit/config.toml` `[llm]` section; empty key falls
+    /// `~/.config/activegit/config.toml` `[llm]` section; empty key falls
     /// back to `$OPENAI_API_KEY` / `$ANTHROPIC_API_KEY` / `$GEMINI_API_KEY`
     /// / `$OPENROUTER_API_KEY` / `$LLM_API_KEY` at generation time.
     pub llm: LlmConfig,
 }
 
 /// App directory name under the XDG config home.
-pub const APP_DIR: &str = "agentgit";
-/// Pre-rename directory; still used when it exists and `agentgit/` doesn't,
-/// so config and session survive the rename without moving any files.
-const LEGACY_APP_DIR: &str = "git-tui";
+pub const APP_DIR: &str = "activegit";
 
-/// `$XDG_CONFIG_HOME/agentgit` (or `~/.config/agentgit`); holds
+/// `$XDG_CONFIG_HOME/activegit` (or `~/.config/activegit`); holds
 /// `config.toml` and `session.toml`. `None` when neither env var is set.
 pub fn config_dir() -> Option<PathBuf> {
     let base = match std::env::var("XDG_CONFIG_HOME") {
@@ -342,15 +339,9 @@ pub fn config_dir() -> Option<PathBuf> {
     Some(pick_app_dir(&base))
 }
 
-/// `base/agentgit`, unless only the legacy `base/git-tui` exists.
+/// `base/activegit`.
 fn pick_app_dir(base: &Path) -> PathBuf {
-    let dir = base.join(APP_DIR);
-    let legacy = base.join(LEGACY_APP_DIR);
-    if !dir.exists() && legacy.is_dir() {
-        legacy
-    } else {
-        dir
-    }
+    base.join(APP_DIR)
 }
 
 impl Default for Config {
@@ -374,8 +365,8 @@ impl Config {
         Self::from_toml(&text).with_context(|| format!("bad config {}", path.display()))
     }
 
-    /// Load from `$XDG_CONFIG_HOME/agentgit/config.toml`, falling back to
-    /// `~/.config/agentgit/config.toml`. Missing file means defaults.
+    /// Load from `$XDG_CONFIG_HOME/activegit/config.toml`, falling back to
+    /// `~/.config/activegit/config.toml`. Missing file means defaults.
     pub fn load() -> Result<Self> {
         match Self::default_path() {
             Some(path) => Self::load_from_path(&path),
@@ -775,22 +766,15 @@ mod tests {
     }
 
     #[test]
-    fn app_dir_is_agentgit_unless_only_legacy_exists() {
+    fn app_dir_is_activegit() {
         let base = tempfile::TempDir::new().unwrap();
-        // Fresh install: new name.
-        assert_eq!(pick_app_dir(base.path()), base.path().join("agentgit"));
-        // Only the pre-rename dir: keep using it (config + session intact).
-        std::fs::create_dir_all(base.path().join("git-tui")).unwrap();
-        assert_eq!(pick_app_dir(base.path()), base.path().join("git-tui"));
-        // Both present: the new dir wins.
-        std::fs::create_dir_all(base.path().join("agentgit")).unwrap();
-        assert_eq!(pick_app_dir(base.path()), base.path().join("agentgit"));
+        assert_eq!(pick_app_dir(base.path()), base.path().join("activegit"));
     }
 
     #[test]
     fn save_llm_preserves_other_sections_and_roundtrips() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("agentgit").join("config.toml");
+        let path = dir.path().join("activegit").join("config.toml");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,

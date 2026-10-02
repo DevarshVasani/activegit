@@ -383,7 +383,7 @@ fn missing_key_hint(config: &LlmConfig) -> String {
     };
     format!(
         "no API key for provider {:?}: press A in the file list to configure it via TUI, \
-         or set [llm] api_key in ~/.config/agentgit/config.toml or ${var} (or $LLM_API_KEY)",
+         or set [llm] api_key in ~/.config/activegit/config.toml or ${var} (or $LLM_API_KEY)",
         config.provider
     )
 }
@@ -418,8 +418,8 @@ fn call_openai_compatible(config: &LlmConfig, prompt: &str) -> Result<String, Gi
     }
     if config.provider == "openrouter" {
         req = req
-            .set("HTTP-Referer", "https://github.com/DevarshVasani/AgentGit")
-            .set("X-Title", "agentgit");
+            .set("HTTP-Referer", "https://github.com/DevarshVasani/activegit")
+            .set("X-Title", "activegit");
     }
     let resp = req.send_json(body).map_err(map_http_err)?;
     let json: serde_json::Value = resp.into_json().map_err(|e| GitError::Llm(e.to_string()))?;

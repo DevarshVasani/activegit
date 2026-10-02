@@ -5,6 +5,7 @@ mod markdown;
 mod session;
 mod syntax;
 mod ui;
+mod welcome;
 mod words;
 mod workspace;
 
@@ -46,9 +47,18 @@ fn main() -> Result<()> {
     if let Some(name) = cli.theme {
         config.theme = Theme::by_name(&name).with_context(|| format!("unknown theme {name:?}"))?;
     }
+    let has_explicit_paths = !cli.paths.is_empty();
+    let no_welcome_flag = cli.no_welcome;
     let (paths, restored_current) = resolve_startup_paths(cli.paths);
     let mut workspace = Workspace::open(paths, config)?;
     workspace.set_session_path(Session::default_path());
+    // First-run welcome overlay: only when launched bare (no explicit
+    // paths), interactive, and never seen before. Wrapper invocations
+    // pass an explicit repo, pipes are not TTYs — both skip it.
+    workspace.set_show_welcome(welcome::should_show_welcome_runtime(
+        has_explicit_paths,
+        no_welcome_flag,
+    ));
     if let Some(idx) = restored_current {
         workspace.set_current(idx);
     } else {
@@ -141,15 +151,17 @@ fn normalize_key(code: KeyCode, modifiers: KeyModifiers) -> KeyCode {
 struct Cli {
     theme: Option<String>,
     paths: Vec<PathBuf>,
+    no_welcome: bool,
 }
 
 const USAGE: &str =
-    "usage: agentgit [--theme <default|tokyo-night|catppuccin|legacy>] [--repo <path>]... [<path>...] [-- <path>...]";
+    "usage: activegit [--theme <default|tokyo-night|catppuccin|legacy>] [--no-welcome] [--repo <path>]... [<path>...] [-- <path>...]";
 
 fn parse_args(args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Cli> {
     let mut cli = Cli {
         theme: None,
         paths: Vec::new(),
+        no_welcome: false,
     };
     let mut args = args.into_iter().map(Into::into);
     while let Some(arg) = args.next() {
@@ -160,8 +172,10 @@ fn parse_args(args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Cli
             println!("{USAGE}");
             std::process::exit(0);
         } else if arg == "-V" || arg == "--version" {
-            println!("agentgit {}", env!("CARGO_PKG_VERSION"));
+            println!("activegit {}", env!("CARGO_PKG_VERSION"));
             std::process::exit(0);
+        } else if arg == "--no-welcome" {
+            cli.no_welcome = true;
         } else if arg == "--theme" {
             let name = args.next().context("--theme needs a value")?;
             cli.theme = Some(
@@ -204,6 +218,7 @@ fn run(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     workspace: &mut Workspace,
 ) -> Result<()> {
+    let mut welcome_was_visible = workspace.welcome_visible();
     loop {
         if event::poll(Duration::from_millis(100)).context("cannot poll input")? {
             if let Event::Key(key) = event::read().context("cannot read input")? {
@@ -230,6 +245,11 @@ fn run(
             }
         }
         workspace.poll();
+        // Persist the welcome dismissal so the intro shows exactly once.
+        if welcome_was_visible && !workspace.welcome_visible() {
+            welcome::mark_welcome_seen();
+        }
+        welcome_was_visible = workspace.welcome_visible();
         terminal
             .draw(|f| ui::render_workspace(f, workspace))
             .context("cannot render")?;
@@ -249,7 +269,15 @@ mod tests {
 
     #[test]
     fn no_args_means_no_override() {
-        assert!(parse_args(args(&[])).unwrap().theme.is_none());
+        let cli = parse_args(args(&[])).unwrap();
+        assert!(cli.theme.is_none());
+        assert!(cli.paths.is_empty());
+        assert!(!cli.no_welcome);
+    }
+
+    #[test]
+    fn no_welcome_flag_opts_out() {
+        assert!(parse_args(args(&["--no-welcome"])).unwrap().no_welcome);
     }
 
     #[test]

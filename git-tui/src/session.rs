@@ -1,7 +1,7 @@
 //! Session persistence: which projects were open.
 //!
-//! Stored at `$XDG_CONFIG_HOME/agentgit/session.toml` (or
-//! `~/.config/agentgit/session.toml`). When the app starts with no explicit
+//! Stored at `$XDG_CONFIG_HOME/activegit/session.toml` (or
+//! `~/.config/activegit/session.toml`). When the app starts with no explicit
 //! paths, these projects are re-opened; explicit CLI paths override the
 //! session and replace it.
 

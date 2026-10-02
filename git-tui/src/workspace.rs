@@ -16,6 +16,9 @@ pub struct Workspace {
     config: Config,
     current: usize,
     quit: bool,
+    /// First-run welcome overlay. Set once at startup; any dismiss key
+    /// clears it and the binary persists the marker so it shows only once.
+    show_welcome: bool,
     /// Where to persist the open-project session. `None` disables
     /// persistence (tests); the binary sets it to `Session::default_path()`.
     session_path: Option<PathBuf>,
@@ -36,6 +39,7 @@ impl Workspace {
             config,
             current: 0,
             quit: false,
+            show_welcome: false,
             session_path: None,
         };
         for input in &inputs {
@@ -436,6 +440,11 @@ impl Workspace {
     /// Modifier-aware dispatch: Shift+A inside the commit box generates a
     /// commit message; everywhere else behaves like [`Self::on_key`].
     pub fn on_key_with_modifiers(&mut self, key: KeyCode, shift_held: bool) {
+        // The welcome overlay owns every key until dismissed.
+        if self.show_welcome {
+            self.on_key_welcome(key);
+            return;
+        }
         // The browser owns every key until it closes (Enter opens a repo
         // or browses into a plain folder, Esc closes). No global bindings
         // leak in.
@@ -587,6 +596,40 @@ impl Workspace {
 
     pub fn should_quit(&self) -> bool {
         self.quit || self.apps.iter().any(App::should_quit)
+    }
+
+    /// Whether the first-run welcome overlay is up.
+    pub fn welcome_visible(&self) -> bool {
+        self.show_welcome
+    }
+
+    /// Show or hide the first-run welcome overlay.
+    pub fn set_show_welcome(&mut self, show: bool) {
+        self.show_welcome = show;
+    }
+
+    /// Dismiss the welcome overlay (persistence is handled by the caller).
+    pub fn dismiss_welcome(&mut self) {
+        self.show_welcome = false;
+    }
+
+    /// Keys while the welcome overlay is up: it owns every key until
+    /// dismissed. Enter/Esc/space/q start; `o` starts and opens the
+    /// project browser; anything else is ignored.
+    fn on_key_welcome(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Enter
+            | KeyCode::Esc
+            | KeyCode::Char(' ')
+            | KeyCode::Char('q')
+            | KeyCode::Char('Q') => self.dismiss_welcome(),
+            KeyCode::Char('o') | KeyCode::Char('O') => {
+                self.dismiss_welcome();
+                let start = self.roots[self.current].clone();
+                self.current_mut().begin_open_project(start);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1233,5 +1276,51 @@ mod tests {
         let ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
         // No session path set (tests): must not panic or touch the disk.
         ws.save_session();
+    }
+
+    #[test]
+    fn welcome_is_hidden_by_default() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        assert!(!ws.welcome_visible());
+    }
+
+    #[test]
+    fn welcome_dismiss_keys_close_it_without_quitting() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        for key in [
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Char(' '),
+            KeyCode::Char('q'),
+            KeyCode::Char('Q'),
+        ] {
+            let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+            ws.set_show_welcome(true);
+            ws.on_key(key);
+            assert!(!ws.welcome_visible(), "key {key:?} did not dismiss");
+            assert!(!ws.should_quit(), "key {key:?} quit instead of dismiss");
+            assert_eq!(ws.len(), 1, "key {key:?} closed the project");
+        }
+    }
+
+    #[test]
+    fn welcome_ignores_other_keys() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ws.set_show_welcome(true);
+        ws.on_key(KeyCode::Char('j'));
+        assert!(ws.welcome_visible());
+        assert!(!ws.should_quit());
+    }
+
+    #[test]
+    fn welcome_o_opens_the_project_browser() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ws.set_show_welcome(true);
+        ws.on_key(KeyCode::Char('o'));
+        assert!(!ws.welcome_visible());
+        assert_eq!(ws.current().mode(), Mode::OpenProject);
     }
 }
