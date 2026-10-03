@@ -300,12 +300,21 @@ mod tests {
         assert_eq!(r.head_summary().unwrap(), "(no commits yet)");
     }
 
+    /// libgit2 reports long-form paths with `/` separators, while the temp
+    /// dir may be a Windows 8.3 short path (`RUNNER~1`); compare resolved.
+    fn assert_same_dir(a: &Path, b: &Path) {
+        assert_eq!(
+            std::fs::canonicalize(a).unwrap(),
+            std::fs::canonicalize(b).unwrap()
+        );
+    }
+
     #[test]
     fn workdir_returns_repo_root_for_tui_bootstrap() {
         let (dir, repo) = testutil::init_repo();
         testutil::commit_file(&repo, "a.txt", "x\n", "init");
         let r = Repo::from_inner(repo);
-        assert_eq!(r.workdir().unwrap(), dir.path());
+        assert_same_dir(&r.workdir().unwrap(), dir.path());
     }
 
     #[test]
@@ -364,7 +373,7 @@ mod tests {
         // empty (unborn, no-file) project.
         let nested = target.join("sub");
         std::fs::create_dir_all(&nested).unwrap();
-        assert_eq!(Repo::discover_root(&nested).unwrap(), target);
+        assert_same_dir(&Repo::discover_root(&nested).unwrap(), &target);
         assert!(r.status().unwrap().files.is_empty());
     }
 }
