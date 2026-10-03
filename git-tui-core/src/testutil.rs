@@ -25,6 +25,8 @@ pub fn init_repo() -> (TempDir, Repository) {
             .expect("set user.email");
         cfg.set_str("init.defaultBranch", "main").ok();
         cfg.set_str("commit.gpgsign", "false").ok();
+        // Git for Windows enables autocrlf system-wide; keep checkouts byte-exact.
+        cfg.set_str("core.autocrlf", "false").ok();
     }
     (dir, repo)
 }
@@ -64,6 +66,8 @@ pub fn clone_local(src: &Path) -> (TempDir, Repository) {
         cfg.set_str("user.email", "test@example.com")
             .expect("set user.email");
         cfg.set_str("commit.gpgsign", "false").ok();
+        // Git for Windows enables autocrlf system-wide; keep checkouts byte-exact.
+        cfg.set_str("core.autocrlf", "false").ok();
     }
     (dir, repo)
 }

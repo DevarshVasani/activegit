@@ -1,6 +1,7 @@
 //! Phase 5: TOML config — keybinding overrides and theme selection.
 //!
-//! `~/.config/activegit/config.toml`. Missing file means defaults; anything
+//! `~/.config/activegit/config.toml` (`%APPDATA%\activegit\config.toml` on
+//! Windows). Missing file means defaults; anything
 //! present overrides just that piece. Invalid names fail fast with the file
 //! path and the offending value.
 
@@ -329,14 +330,28 @@ pub struct Config {
 /// App directory name under the XDG config home.
 pub const APP_DIR: &str = "activegit";
 
-/// `$XDG_CONFIG_HOME/activegit` (or `~/.config/activegit`); holds
-/// `config.toml` and `session.toml`. `None` when neither env var is set.
+/// `$XDG_CONFIG_HOME/activegit` (or `~/.config/activegit`; on Windows
+/// `%APPDATA%\activegit`); holds `config.toml` and `session.toml`. `None`
+/// when no base directory can be found.
 pub fn config_dir() -> Option<PathBuf> {
-    let base = match std::env::var("XDG_CONFIG_HOME") {
-        Ok(xdg) if !xdg.is_empty() => PathBuf::from(xdg),
-        _ => PathBuf::from(std::env::var("HOME").ok()?).join(".config"),
+    let base = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(xdg) if !xdg.is_empty() => PathBuf::from(xdg),
+        _ => default_config_base()?,
     };
     Some(pick_app_dir(&base))
+}
+
+#[cfg(windows)]
+fn default_config_base() -> Option<PathBuf> {
+    match std::env::var_os("APPDATA") {
+        Some(appdata) if !appdata.is_empty() => Some(PathBuf::from(appdata)),
+        _ => git_tui_core::repo::home_dir().map(|h| h.join("AppData").join("Roaming")),
+    }
+}
+
+#[cfg(not(windows))]
+fn default_config_base() -> Option<PathBuf> {
+    git_tui_core::repo::home_dir().map(|h| h.join(".config"))
 }
 
 /// `base/activegit`.
@@ -366,7 +381,8 @@ impl Config {
     }
 
     /// Load from `$XDG_CONFIG_HOME/activegit/config.toml`, falling back to
-    /// `~/.config/activegit/config.toml`. Missing file means defaults.
+    /// `~/.config/activegit/config.toml` (`%APPDATA%\activegit` on Windows).
+    /// Missing file means defaults.
     pub fn load() -> Result<Self> {
         match Self::default_path() {
             Some(path) => Self::load_from_path(&path),

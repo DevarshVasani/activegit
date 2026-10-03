@@ -25,6 +25,7 @@ toml = "0.9.6"
 unicode-width = "0.1"
 syntect = { version = "5.2", default-features = false, features = ["default-syntaxes", "default-themes", "parsing", "regex-onig"] }
 pulldown-cmark = { version = "0.12", default-features = false, features = ["simd"] }
+dunce = "1"
 
 [dev-dependencies]
 tempfile = "3"

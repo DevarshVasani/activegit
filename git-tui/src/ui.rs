@@ -2499,7 +2499,7 @@ fn render_open_browser_modal(
                     ));
                 }
                 let abs = browser.cwd.join(&name);
-                let canon = std::fs::canonicalize(&abs).unwrap_or(abs);
+                let canon = dunce::canonicalize(&abs).unwrap_or(abs);
                 if open_roots.contains(&canon) {
                     spans.push(Span::styled(
                         " [open]".to_string(),

@@ -1,7 +1,8 @@
 //! Session persistence: which projects were open.
 //!
 //! Stored at `$XDG_CONFIG_HOME/activegit/session.toml` (or
-//! `~/.config/activegit/session.toml`). When the app starts with no explicit
+//! `~/.config/activegit/session.toml`; `%APPDATA%\activegit\session.toml` on
+//! Windows). When the app starts with no explicit
 //! paths, these projects are re-opened; explicit CLI paths override the
 //! session and replace it.
 
@@ -36,8 +37,8 @@ impl Session {
         Self { projects, current }
     }
 
-    /// Where the session file lives. `None` when `$HOME` is unset and no
-    /// `$XDG_CONFIG_HOME` override exists (then persistence is disabled).
+    /// Where the session file lives. `None` when no config directory can be
+    /// found (see [`crate::config::config_dir`]); persistence is then disabled.
     pub fn default_path() -> Option<PathBuf> {
         crate::config::config_dir().map(|d| d.join("session.toml"))
     }
