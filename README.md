@@ -45,7 +45,7 @@ credential helpers keep working unchanged.
 <tr>
 <td width="50%" valign="top">
 <img src="docs/screenshots/llm.png" alt="LLM setup form with provider, model, API key and base URL fields">
-<p align="center"><b>Bring your own LLM</b><br><sub>OpenAI, OpenRouter, Anthropic, Gemini, Ollama, or any OpenAI-compatible endpoint. Set it up in the TUI with <code>A</code>.</sub></p>
+<p align="center"><b>Bring your own LLM</b><br><sub>OpenAI, OpenRouter, Anthropic, Gemini, Ollama, or any OpenAI-compatible endpoint. Set it up in the TUI with <code>A</code>: <code>←/→</code> step through providers, and the model list is fetched live from the provider you picked.</sub></p>
 </td>
 <td width="50%" valign="top">
 <img src="docs/screenshots/finder.png" alt="Fuzzy file finder popup filtering files by 'hand'">
@@ -73,6 +73,37 @@ credential helpers keep working unchanged.
 | **Sync**                   | `p` pull / `P` push / publish-to-origin, with upstream tracking (`main → origin/main ↑2`)                  |
 | **Multi-project**          | Several repos as tabs in one window; the session is restored on next launch                                |
 | **Never blocks**           | Git work runs on a background thread, so the UI stays responsive while git works                           |
+
+## How activegit compares
+
+Measured 2026-10-03 on x86_64 Linux (16 CPUs) with the same harness for
+each tool: an 80×24 pty, a 60-file fixture repo (20 modified, 6 untracked),
+release builds. px0 serves a browser UI, so its "start" is time until the
+local URL responds rather than a terminal first frame.
+
+| Measure (lower is better)          | activegit 0.2.0 | lazygit 0.65.0 | px0 0.1.16 |
+| ---------------------------------- | --------------- | -------------- | ---------- |
+| Binary size                        | 11.4 MiB        | 19.2 MiB       | 12.3 MiB   |
+| Cold start to usable UI (median)    | ~10 ms          | ~12 ms         | ~50 ms     |
+| Idle memory RSS                    | ~13 MiB         | ~17 MiB        | ~18 MiB    |
+
+In-app hot paths (activegit's own bench, release medians): status of 300
+files **0.60 ms**, unstaged diff of a 5,000-line file **4.4 ms**, fuzzy rank
+over 5,000 files **1.1 ms**, full syntax highlight of 200 Rust lines
+**20.9 ms**. See `target/bench-report.html` after
+`cargo run -p activegit-bench --release` for the full report. px0 publishes
+its own numbers (95,710-file index in 370 ms, fuzzy search ~6 ms) at
+[px0.ai](https://px0.ai).
+
+| Workflow                               | activegit              | lazygit            | px0 0.1.16 ([px0.ai](https://px0.ai)) |
+| -------------------------------------- | ---------------------- | ------------------ | ------------------------------------- |
+| Runtime                                | Rust TUI               | Go TUI             | Go binary + browser UI                |
+| Inline + side-by-side diff             | ✓ both                 | ✓ both             | ✓ split + unified                     |
+| Stage files, folders, **single hunks** | ✓                      | ✓                  | ✓ per-file                            |
+| AI commit message                      | ✓ built-in (`Shift+A`) | via custom command | ✓ via agent harness                   |
+| PR review (comments, approvals)        | —                      | —                  | ✓                                     |
+| Multi-repo tabs + restored session     | ✓                      | —                  | — (one workspace per process)         |
+| Fully rebindable keys                  | ✓ TOML                 | ✓ YAML             | —                                     |
 
 ## Install
 
@@ -246,6 +277,12 @@ api_key = ""               # empty = read from the provider's env var
 > **AI commits:** stage with `space`, open the commit box with `c`, then press
 > `Shift+A`. The message is built from the index-vs-HEAD diff. `ollama` runs
 > locally and needs no API key.
+
+The setup form (`A` in the file list) never carries a built-in model list:
+it asks the provider which models it currently offers, and refetches
+whenever you change the provider, API key, or base URL. Without a key
+(Ollama aside) it says so and leaves the model field free text, so a custom
+or not-yet-listed id can always be typed in.
 
 <details>
 <summary><b>All rebindable actions</b></summary>

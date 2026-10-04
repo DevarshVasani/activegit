@@ -25,6 +25,130 @@ pub const PROVIDERS: &[&str] = &[
     "custom",
 ];
 
+/// Fallback model when `[llm] model` is unset. Not a curated list: the
+/// setup form's model options always come from the provider (see
+/// [`fetch_models`]), this is only the pre-network default.
+const DEFAULT_MODEL: &str = "gpt-4o-mini";
+
+/// Model ids the provider currently offers, for the setup form's model
+/// row. Blocking [`ureq`] like the chat calls, so the TUI runs it on the
+/// [`crate::jobqueue`] worker and the row can show "loading…".
+///
+/// Model lists change constantly, so nothing here is hardcoded per
+/// provider: every provider is asked over HTTP. Ids come back sorted and
+/// deduplicated so `←/→` cycles them in a stable order. A provider that
+/// can't be reached returns the error, and the row stays free text.
+pub fn fetch_models(config: &LlmConfig) -> Result<Vec<String>, GitError> {
+    if !config.is_configured() {
+        return Err(GitError::LlmModels(missing_key_hint(config)));
+    }
+    let mut models = match config.provider.as_str() {
+        "anthropic" => fetch_anthropic_models(config),
+        "gemini" => fetch_gemini_models(config),
+        _ => fetch_openai_models(config),
+    }
+    .map_err(|e| GitError::LlmModels(llm_error_message(&e)))?;
+    models.sort_unstable();
+    models.dedup();
+    Ok(models)
+}
+
+/// Strip the `GitError` wrapper's own prefix: [`GitError::LlmModels`]
+/// supplies the context for this call, so the inner provider message must
+/// not repeat it.
+fn llm_error_message(e: &GitError) -> String {
+    let full = e.to_string();
+    full.split_once(": ")
+        .map(|(_, rest)| rest.to_string())
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(full)
+}
+
+/// `GET {base}/models` — the OpenAI-compatible listing, shared by
+/// `openai`, `openrouter`, `ollama`, and `custom`.
+fn fetch_openai_models(config: &LlmConfig) -> Result<Vec<String>, GitError> {
+    let base = require_base_url(config)?;
+    let url = format!("{base}/models");
+    let mut req = agent().get(&url);
+    let key = config.effective_api_key();
+    if !key.is_empty() {
+        req = req.set("Authorization", &format!("Bearer {key}"));
+    }
+    model_ids(req.call().map_err(map_http_err)?)
+}
+
+/// Anthropic's listing (`GET /v1/models`), same `data[].id` shape.
+fn fetch_anthropic_models(config: &LlmConfig) -> Result<Vec<String>, GitError> {
+    let base = config
+        .base_url
+        .clone()
+        .filter(|u| !u.trim().is_empty())
+        .map(|u| u.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| "https://api.anthropic.com/v1".into());
+    let url = format!("{base}/models");
+    let req = agent()
+        .get(&url)
+        .set("x-api-key", &config.effective_api_key())
+        .set("anthropic-version", "2023-06-01");
+    model_ids(req.call().map_err(map_http_err)?)
+}
+
+/// Gemini's listing (`GET /v1beta/models?key=…`): `models[].name`, each
+/// prefixed with `models/`.
+fn fetch_gemini_models(config: &LlmConfig) -> Result<Vec<String>, GitError> {
+    let base = config
+        .base_url
+        .clone()
+        .filter(|u| !u.trim().is_empty())
+        .map(|u| u.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| "https://generativelanguage.googleapis.com".into());
+    let key = config.effective_api_key();
+    let url = format!("{base}/v1beta/models?key={key}");
+    let json: serde_json::Value = agent()
+        .get(&url)
+        .call()
+        .map_err(map_http_err)?
+        .into_json()
+        .map_err(|e| GitError::Llm(e.to_string()))?;
+    Ok(json["models"]
+        .as_array()
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| m["name"].as_str())
+                .map(|n| n.strip_prefix("models/").unwrap_or(n).to_string())
+                .filter(|n| !n.is_empty())
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Pull `data[].id` out of an OpenAI-shaped listing response.
+fn model_ids(resp: ureq::Response) -> Result<Vec<String>, GitError> {
+    let json: serde_json::Value = resp.into_json().map_err(|e| GitError::Llm(e.to_string()))?;
+    Ok(json["data"]
+        .as_array()
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| m["id"].as_str())
+                .map(|id| id.to_string())
+                .filter(|id| !id.is_empty())
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+fn require_base_url(config: &LlmConfig) -> Result<String, GitError> {
+    let base = config.effective_base_url();
+    if base.is_empty() {
+        return Err(GitError::Llm(
+            "provider \"custom\" needs [llm] base_url set to list models".into(),
+        ));
+    }
+    Ok(base)
+}
+
 /// Configuration for one LLM provider. Lives in core so the worker thread
 /// can use it without depending on the TUI crate; the TUI `[llm]` config
 /// section parses directly into this shape.
@@ -43,7 +167,7 @@ impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             provider: "openai".into(),
-            model: "gpt-4o-mini".into(),
+            model: DEFAULT_MODEL.into(),
             api_key: String::new(),
             base_url: None,
         }
@@ -504,6 +628,121 @@ mod tests {
     use super::*;
     use crate::testutil;
     use crate::testutil::ENV_LOCK;
+
+    /// One-shot mock provider: replies to the first request with `body`
+    /// and records the request line, so a test can assert both the parsed
+    /// ids and the URL/auth actually used.
+    fn mock_provider(body: &'static str) -> (u16, std::sync::mpsc::Receiver<String>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut stream = stream;
+            let mut request = String::new();
+            BufReader::new(&stream).read_line(&mut request).unwrap();
+            let _ = tx.send(request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        (port, rx)
+    }
+
+    #[test]
+    fn openai_shaped_listing_is_parsed_sorted_and_deduped() {
+        let (port, request) = mock_provider(
+            r#"{"data":[{"id":"gpt-4o"},{"id":"gpt-4o-mini"},{"id":"gpt-4o-mini"},{"id":""}]}"#,
+        );
+        let cfg = LlmConfig {
+            provider: "openai".into(),
+            model: String::new(),
+            api_key: "sk-test".into(),
+            base_url: Some(format!("http://127.0.0.1:{port}/v1")),
+        };
+        let models = fetch_models(&cfg).unwrap();
+        // Sorted, deduped, and the empty id dropped.
+        assert_eq!(models, vec!["gpt-4o", "gpt-4o-mini"]);
+        let line = request
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(line.starts_with("GET /v1/models "), "got {line}");
+    }
+
+    #[test]
+    fn each_provider_hits_its_own_listing_endpoint() {
+        // Anthropic: `data[].id` like OpenAI, but under /v1/models.
+        let (port, request) = mock_provider(
+            r#"{"data":[{"id":"claude-opus-4-1"},{"id":"claude-3-5-haiku-latest"}]}"#,
+        );
+        let cfg = LlmConfig {
+            provider: "anthropic".into(),
+            model: String::new(),
+            api_key: "sk-test".into(),
+            base_url: Some(format!("http://127.0.0.1:{port}/anthropic/v1")),
+        };
+        let models = fetch_models(&cfg).unwrap();
+        assert_eq!(models, vec!["claude-3-5-haiku-latest", "claude-opus-4-1"]);
+        assert!(request
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .starts_with("GET /anthropic/v1/models "));
+
+        // Gemini: `models[].name`, each prefixed with `models/`.
+        let (port, request) = mock_provider(
+            r#"{"models":[{"name":"models/gemini-2.5-pro"},{"name":"models/gemini-2.0-flash"}]}"#,
+        );
+        let cfg = LlmConfig {
+            provider: "gemini".into(),
+            model: String::new(),
+            api_key: "sk-test".into(),
+            base_url: Some(format!("http://127.0.0.1:{port}")),
+        };
+        let models = fetch_models(&cfg).unwrap();
+        assert_eq!(models, vec!["gemini-2.0-flash", "gemini-2.5-pro"]);
+        assert!(request
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .starts_with("GET /v1beta/models?key="));
+    }
+
+    #[test]
+    fn model_fetch_errors_name_the_provider_problem() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("OPENAI_API_KEY").ok();
+        std::env::remove_var("OPENAI_API_KEY");
+        // No key: the caller is told why rather than getting a 401 back.
+        let err = fetch_models(&LlmConfig {
+            api_key: String::new(),
+            ..Default::default()
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("could not list provider models"), "got {err}");
+        assert!(err.contains("API key"), "got {err}");
+        match prev {
+            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn custom_provider_without_base_url_cannot_list_models() {
+        let err = fetch_models(&LlmConfig {
+            provider: "custom".into(),
+            api_key: "sk-test".into(),
+            base_url: None,
+            ..Default::default()
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("base_url"), "got {err}");
+    }
 
     #[test]
     fn api_key_prefers_config_then_env() {

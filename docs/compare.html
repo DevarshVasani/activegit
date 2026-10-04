@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ActiveGit comparison — activegit vs lazygit vs px0</title>
+<style>
+:root{--bg:#1a1b26;--panel:#24283b;--card:#2a2e44;--fg:#c0caf5;--dim:#787c99;
+--blue:#7aa2f7;--green:#9ece6a;--cyan:#7dcfff;--border:#3b3f5c}
+*{box-sizing:border-box}body{background:var(--bg);color:var(--fg);
+font:15px/1.55 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+margin:0;padding:0 0 64px}header{padding:36px 28px 20px;max-width:1080px;margin:0 auto}
+h1{margin:0 0 4px;font-size:30px}h1 span{color:var(--green)}
+h2{margin-top:30px;font-size:20px}
+.sub{color:var(--dim);margin:0 0 14px}
+.meta{display:flex;flex-wrap:wrap;gap:8px}.meta div{background:var(--panel);
+border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:13px}
+.meta b{color:var(--cyan);font-weight:600}main{max-width:1080px;margin:0 auto;padding:0 28px}
+table{width:100%;border-collapse:collapse;background:var(--panel);
+border:1px solid var(--border);border-radius:12px;overflow:hidden;margin:14px 0}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--border);font-size:14px}
+th{color:var(--dim);text-transform:uppercase;font-size:12px;letter-spacing:.04em}
+tr:last-child td{border-bottom:none}td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+td.win{color:var(--green);font-weight:700}
+.note{color:var(--dim);font-size:13px}
+a{color:var(--blue);text-decoration:none}a:hover{text-decoration:underline}
+code{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:1px 6px;font-size:13px}
+footer{max-width:1080px;margin:22px auto 0;padding:0 28px;color:var(--dim);font-size:13px}
+</style></head><body>
+<header><h1>ActiveGit <span>comparison</span></h1>
+<p class="sub">activegit 0.2.0 · lazygit 0.65.0 · px0 0.1.16 — measured 2026-10-03</p>
+<div class="meta"><div><b>machine</b> x86_64 Linux · 16 CPUs</div><div><b>harness</b> 80×24 pty · release builds</div>
+<div><b>fixture</b> 60-file repo · 20 modified · 6 untracked</div></div></header>
+<main>
+<h2>Performance (lower is better)</h2>
+<table><thead><tr><th>Measure</th><th class="num">activegit 0.2.0</th><th class="num">lazygit 0.65.0</th><th class="num">px0 0.1.16</th></tr></thead><tbody>
+<tr><td>Binary size</td><td class="num win">11.4 MiB</td><td class="num">19.2 MiB</td><td class="num">12.3 MiB</td></tr>
+<tr><td>Cold start to usable UI (median)</td><td class="num win">~10 ms</td><td class="num">~12 ms</td><td class="num">~50 ms</td></tr>
+<tr><td>Idle memory RSS</td><td class="num win">~13 MiB</td><td class="num">~17 MiB</td><td class="num">~18 MiB</td></tr>
+</tbody></table>
+<p class="note">px0 serves a browser UI, so its "start" is time until the local URL
+responds rather than a terminal first frame. In-app hot paths (activegit's own
+bench, release medians): status of 300 files <b>0.60 ms</b>, unstaged diff of a
+5,000-line file <b>4.4 ms</b>, fuzzy rank over 5,000 files <b>1.1 ms</b>, full
+syntax highlight of 200 Rust lines <b>20.9 ms</b>. px0 publishes its own numbers
+(95,710-file index in 370 ms, fuzzy search ~6 ms) at
+<a href="https://px0.ai">px0.ai</a>.</p>
+
+<h2>Workflow</h2>
+<table><thead><tr><th>Capability</th><th>activegit</th><th>lazygit</th><th>px0</th></tr></thead><tbody>
+<tr><td>Runtime</td><td>Rust TUI</td><td>Go TUI</td><td>Go binary + browser UI</td></tr>
+<tr><td>Inline + side-by-side diff</td><td>✓ both</td><td>✓ both</td><td>✓ split + unified</td></tr>
+<tr><td>Stage files, folders, <b>single hunks</b></td><td>✓</td><td>✓</td><td>✓ per-file</td></tr>
+<tr><td>AI commit message</td><td>✓ built-in (<code>Shift+A</code>)</td><td>via custom command</td><td>✓ via agent harness</td></tr>
+<tr><td>PR review (comments, approvals)</td><td>—</td><td>—</td><td>✓</td></tr>
+<tr><td>Multi-repo tabs + restored session</td><td>✓</td><td>—</td><td>— (one workspace per process)</td></tr>
+<tr><td>Fully rebindable keys</td><td>✓ TOML</td><td>✓ YAML</td><td>—</td></tr>
+</tbody></table>
+</main>
+<footer><p>Numbers measured on this machine with the fixture repo above; rerun the
+activegit bench with <code>cargo run -p activegit-bench --release</code>.
+See the <a href="https://github.com/DevarshVasani/activegit">README</a> for install instructions.</p></footer>
+</body></html>

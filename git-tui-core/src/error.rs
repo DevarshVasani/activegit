@@ -44,4 +44,7 @@ pub enum GitError {
 
     #[error("commit message generation failed: {0}")]
     Llm(String),
+
+    #[error("could not list provider models: {0}")]
+    LlmModels(String),
 }
