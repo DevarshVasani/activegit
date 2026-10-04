@@ -301,6 +301,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         }
         Mode::OpenProject => render_open_browser_modal(frame, area, app, &[]),
         Mode::ConfirmInit => render_confirm_init_modal(frame, area, app),
+        Mode::ConfirmPush => render_confirm_push_modal(frame, area, app),
         Mode::LlmSettings => render_llm_modal(frame, area, app),
         Mode::FindFile => {
             // Opened fullscreen: keep the diff behind the modal.
@@ -366,6 +367,7 @@ pub fn render_workspace(frame: &mut Frame, ws: &Workspace) {
         }
         Mode::OpenProject => render_open_browser_modal(frame, body, app, ws.project_roots()),
         Mode::ConfirmInit => render_confirm_init_modal(frame, body, app),
+        Mode::ConfirmPush => render_confirm_push_modal(frame, body, app),
         Mode::LlmSettings => render_llm_modal(frame, body, app),
         Mode::FindFile => {
             if app.finder_return() == Mode::FullDiff {
@@ -2157,6 +2159,7 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
             "type to filter · ↑/↓ move · enter open/descend · → descend · ← up · tab jump to path · esc clear/close"
         }
         Mode::ConfirmInit => "enter git init here · esc back · any other key picks another folder",
+        Mode::ConfirmPush => "enter push to upstream · esc cancel",
         Mode::Normal => {
             "space stage file/dir · d discard · c commit · A llm · m preview · p pull · P push · / find · enter diff · Shift+→/5 · o open · r refresh · q close · Q quit"
         }
@@ -2892,6 +2895,49 @@ fn render_confirm_init_modal(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
+/// Confirm step for pushing to the tracked upstream (`P` with an
+/// upstream set): Enter pushes, Esc backs out. The `[Push]`/`[Cancel]`
+/// buttons are clickable; their screen position is recorded on the app
+/// for mouse hit-testing (must stay in lockstep with
+/// [`App::click_confirm_push`](crate::app::App)).
+fn render_confirm_push_modal(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme();
+    let popup = centered_rect(area, 64, 7);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), popup);
+    let block = panel_block(true, theme, " Push to upstream? ".to_string());
+    let target = app
+        .pending_push()
+        .map(|(remote, branch)| format!("{branch} → {remote}/{branch}"))
+        .unwrap_or_else(|| "(loading…)".to_string());
+    let btn_style = Style::default()
+        .fg(theme.border_focused)
+        .add_modifier(Modifier::BOLD);
+    let lines = vec![
+        Line::raw("Push the current branch to its tracked upstream:"),
+        Line::from(vec![Span::styled(
+            target,
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+        )]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("[Push] ".to_string(), btn_style),
+            Span::styled(" ".to_string(), btn_style),
+            Span::styled("[Cancel] ".to_string(), btn_style),
+            Span::styled(
+                " Enter push · Esc cancel".to_string(),
+                Style::default().fg(theme.hint),
+            ),
+        ]),
+    ];
+    // Buttons start one cell past the popup border, on the last line.
+    app.set_confirm_btn(Some((
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(1).saturating_add(3),
+    )));
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
 /// First-run welcome overlay: what activegit is, its features, and the
 /// keybindings to start with. Dismissed with enter/esc/q (see the hint).
 fn render_welcome_modal(frame: &mut Frame, area: Rect, theme: Theme) {
@@ -3528,6 +3574,23 @@ mod tests {
         let s = screen(&app, 100, 28);
         assert!(s.contains("[Stage]"), "footer must show buttons:\n{s}");
         assert!(s.contains("[Find]"), "footer must show Find:\n{s}");
+    }
+
+    #[test]
+    fn push_confirm_modal_shows_target_and_buttons() {
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        app.set_pending_push_for_test("origin", "main");
+        let s = screen(&app, 100, 32);
+        assert!(
+            s.contains("Push to upstream?"),
+            "confirm title missing:\n{s}"
+        );
+        assert!(
+            s.contains("main → origin/main"),
+            "push target missing:\n{s}"
+        );
+        assert!(s.contains("[Push]"), "push button missing:\n{s}");
+        assert!(s.contains("[Cancel]"), "cancel button missing:\n{s}");
     }
 
     #[test]

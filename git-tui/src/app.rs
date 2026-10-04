@@ -50,6 +50,9 @@ pub enum Mode {
     ConfirmInit,
     /// Push with no upstream yet: the draft names the remote to push `-u` to.
     SetUpstream,
+    /// Confirm a push to the tracked upstream (`P` with an upstream set):
+    /// Enter pushes, Esc cancels. The `(remote, branch)` pair waits here.
+    ConfirmPush,
     /// Publish a repo with no remotes: the draft is the new `origin` URL.
     SetRemote,
     /// In-TUI LLM provider setup (`A` in the file list): provider, model,
@@ -132,6 +135,12 @@ pub struct App {
     /// Where the push/publish modals return on Enter/Esc (`Normal` or
     /// `FullDiff`), so `P` works fullscreen too.
     sync_return: Mode,
+    /// Push awaiting confirmation (`Mode::ConfirmPush`): `(remote, branch)`
+    /// to push with `git push` on Enter.
+    pending_push: Option<(String, String)>,
+    /// Screen cell where the confirm-push modal's `[Push] [Cancel]`
+    /// buttons start (recorded while rendering, for mouse clicks).
+    confirm_btn: Cell<Option<(u16, u16)>>,
     error: Option<String>,
     quit: bool,
     diff: Option<FileDiff>,
@@ -527,6 +536,8 @@ impl App {
             finder_selected: 0,
             finder_return: Mode::Normal,
             sync_return: Mode::Normal,
+            pending_push: None,
+            confirm_btn: Cell::new(None),
             error: None,
             quit: false,
             diff: None,
@@ -1615,6 +1626,14 @@ impl App {
             self.on_key_full_diff(key);
             return;
         }
+        if self.mode == Mode::ConfirmPush {
+            match key {
+                KeyCode::Enter => self.confirm_push(),
+                KeyCode::Esc => self.cancel_push_confirm(),
+                _ => {}
+            }
+            return;
+        }
         if self.mode == Mode::FindFile {
             match key {
                 KeyCode::Up => self.finder_move(-1),
@@ -1664,15 +1683,17 @@ impl App {
                     Mode::StashPush => self.submit_stash_push(),
                     Mode::SetUpstream => self.submit_push_upstream(),
                     Mode::SetRemote => self.submit_publish(),
-                    // FullDiff and FindFile return before reaching here.
-                    // OpenProject/ConfirmInit submit through `Workspace`
-                    // (it owns all projects), so they are no-ops here.
-                    // LlmSettings is routed to `on_key_llm_settings` above.
+                    // FullDiff, FindFile, and ConfirmPush return before
+                    // reaching here. OpenProject/ConfirmInit submit
+                    // through `Workspace` (it owns all projects), so they
+                    // are no-ops here. LlmSettings is routed to
+                    // `on_key_llm_settings` above.
                     Mode::Normal
                     | Mode::FullDiff
                     | Mode::FindFile
                     | Mode::OpenProject
                     | Mode::ConfirmInit
+                    | Mode::ConfirmPush
                     | Mode::LlmSettings => {}
                 },
                 KeyCode::Esc => {
@@ -2170,11 +2191,16 @@ impl App {
 
     /// Left-press at screen cell `(col, row)`: start a divider drag, or
     /// click a panel / footer button. No-op while a text modal owns the
-    /// keyboard (commit, branch, stash, LLM, push/pull prompts).
+    /// keyboard (commit, branch, stash, LLM, push/pull prompts), except
+    /// the push confirm box, whose buttons are clickable.
     pub fn on_mouse_down(&mut self, col: u16, row: u16) {
         match self.mode {
             Mode::FindFile => {
                 self.click_finder(row);
+                return;
+            }
+            Mode::ConfirmPush => {
+                self.click_confirm_push(col, row);
                 return;
             }
             Mode::Normal | Mode::FullDiff => {}
@@ -2454,6 +2480,27 @@ impl App {
             self.point_hunk_at(index);
         } else {
             self.point_cursor_at(idx);
+        }
+    }
+
+    /// Click the push confirm box's `[Push]` / `[Cancel]` buttons
+    /// (recorded while rendering as `(x, y)` of the `[Push]` start).
+    /// Clicks anywhere else in the box do nothing.
+    fn click_confirm_push(&mut self, col: u16, row: u16) {
+        // `[Push] ` is 7 cells, a 1-cell gap, then `[Cancel] ` (9 cells).
+        const PUSH_W: u16 = 7;
+        const CANCEL_W: u16 = 9;
+        let Some((x, y)) = self.confirm_btn.get() else {
+            return;
+        };
+        if row != y || col < x {
+            return;
+        }
+        let off = col - x;
+        if off < PUSH_W {
+            self.confirm_push();
+        } else if (PUSH_W + 1..PUSH_W + 1 + CANCEL_W).contains(&off) {
+            self.cancel_push_confirm();
         }
     }
 
@@ -3435,9 +3482,10 @@ impl App {
         }
     }
 
-    /// `P`, lazygit-style: push the current branch. With an upstream it
-    /// pushes straight away; without one it asks for the remote (`-u`);
-    /// with no remotes at all it asks for the `origin` URL (publish).
+    /// `P`, lazygit-style: push the current branch. With an upstream a
+    /// confirmation box shows the remote/branch first (Enter pushes, Esc
+    /// cancels); without one it asks for the remote (`-u`); with no
+    /// remotes at all it asks for the `origin` URL (publish).
     fn start_push(&mut self) {
         let Some(branch) = self.status.as_ref().map(|st| st.branch.clone()) else {
             self.error = Some("still loading — try again in a moment".into());
@@ -3455,20 +3503,56 @@ impl App {
             self.draft_cursor = 0;
         } else if let Some(upstream) = sync.upstream {
             let (remote, _) = split_upstream(&upstream);
-            self.syncing = Some("pushing…".into());
-            if let Err(e) = self.queue.submit(AsyncJob::Push {
-                remote: remote.to_string(),
-                branch,
-                set_upstream: false,
-            }) {
-                self.syncing = None;
-                self.error = Some(e.to_string());
-            }
+            self.pending_push = Some((remote.to_string(), branch));
+            self.mode = Mode::ConfirmPush;
         } else {
             self.mode = Mode::SetUpstream;
             self.draft = "origin".to_string();
             self.move_draft_end();
         }
+    }
+
+    /// Push details awaiting confirmation, if `P` opened the confirm box.
+    pub fn pending_push(&self) -> Option<(String, String)> {
+        self.pending_push.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_pending_push_for_test(&mut self, remote: &str, branch: &str) {
+        self.pending_push = Some((remote.to_string(), branch.to_string()));
+        self.mode = Mode::ConfirmPush;
+    }
+
+    /// Recorded while rendering the confirm-push modal: screen cell where
+    /// its `[Push] [Cancel]` buttons start.
+    pub(crate) fn set_confirm_btn(&self, pos: Option<(u16, u16)>) {
+        self.confirm_btn.set(pos);
+    }
+
+    /// Enter in the push confirm box: push to the tracked upstream.
+    fn confirm_push(&mut self) {
+        let Some((remote, branch)) = self.pending_push.clone() else {
+            self.mode = self.sync_return;
+            return;
+        };
+        match self.queue.submit(AsyncJob::Push {
+            remote,
+            branch,
+            set_upstream: false,
+        }) {
+            Ok(()) => {
+                self.mode = self.sync_return;
+                self.pending_push = None;
+                self.syncing = Some("pushing…".into());
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    /// Esc in the push confirm box: back out without pushing.
+    fn cancel_push_confirm(&mut self) {
+        self.mode = self.sync_return;
+        self.pending_push = None;
     }
 
     /// Enter in `SetUpstream`: push `-u <remote> <branch>`.
@@ -5023,7 +5107,7 @@ mod tests {
     }
 
     #[test]
-    fn push_with_upstream_pushes_directly_without_modal() {
+    fn push_with_upstream_asks_for_confirmation_first() {
         let (_dir, _origin, mut app) = sync_harness();
         wait_for_sync(&mut app);
         // Establish the upstream first.
@@ -5040,10 +5124,74 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(app.syncing().is_none());
-        // A fresh `P` now pushes straight away, no modal.
+        // A fresh `P` now opens the confirm box instead of pushing.
         app.on_key(KeyCode::Char('P'));
+        assert_eq!(app.mode(), Mode::ConfirmPush);
+        assert_eq!(
+            app.pending_push(),
+            Some(("origin".to_string(), "main".to_string()))
+        );
+        assert!(app.syncing().is_none(), "nothing pushed yet");
+        // Enter pushes.
+        app.on_key(KeyCode::Enter);
         assert_eq!(app.mode(), Mode::Normal);
         assert_eq!(app.syncing(), Some("pushing…"));
+        assert!(app.pending_push().is_none());
+    }
+
+    #[test]
+    fn esc_in_push_confirm_cancels_without_pushing() {
+        let (_dir, _origin, mut app) = sync_harness();
+        wait_for_sync(&mut app);
+        app.on_key(KeyCode::Char('P'));
+        app.on_key(KeyCode::Enter);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.poll();
+            if app.sync().is_some_and(|s| s.upstream.is_some()) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "push -u never recorded upstream");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        app.on_key(KeyCode::Char('P'));
+        assert_eq!(app.mode(), Mode::ConfirmPush);
+        app.on_key(KeyCode::Esc);
+        assert_eq!(app.mode(), Mode::Normal);
+        assert!(app.syncing().is_none(), "esc must not push");
+        assert!(app.pending_push().is_none());
+        // Other keys are swallowed by the confirm box (no typing leaks).
+        app.on_key(KeyCode::Char('P'));
+        assert_eq!(app.mode(), Mode::ConfirmPush);
+        app.on_key(KeyCode::Char('q'));
+        assert_eq!(app.mode(), Mode::ConfirmPush);
+        assert!(!app.should_quit());
+        app.on_key(KeyCode::Esc);
+    }
+
+    #[test]
+    fn push_confirm_buttons_are_clickable() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.pending_push = Some(("origin".to_string(), "main".to_string()));
+        fx.app.mode = Mode::ConfirmPush;
+        fx.app.set_confirm_btn(Some((10, 20)));
+        // Inside `[Push]`: pushes.
+        fx.app.on_mouse_down(11, 20);
+        assert_eq!(fx.app.syncing(), Some("pushing…"));
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        // Reset: inside `[Cancel]` (starts 8 cells past `[Push]`).
+        fx.app.syncing = None;
+        fx.app.pending_push = Some(("origin".to_string(), "main".to_string()));
+        fx.app.mode = Mode::ConfirmPush;
+        fx.app.on_mouse_down(10 + 8 + 1, 20);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        assert!(fx.app.syncing().is_none(), "cancel must not push");
+        assert!(fx.app.pending_push().is_none());
+        // Clicks elsewhere in the box do nothing.
+        fx.app.pending_push = Some(("origin".to_string(), "main".to_string()));
+        fx.app.mode = Mode::ConfirmPush;
+        fx.app.on_mouse_down(60, 20);
+        assert_eq!(fx.app.mode(), Mode::ConfirmPush);
     }
 
     #[test]
