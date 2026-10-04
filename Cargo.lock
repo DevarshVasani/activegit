@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "activegit"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "git-tui-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "crossbeam-channel",
  "git2",
