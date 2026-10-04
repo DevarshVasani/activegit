@@ -1,6 +1,6 @@
 //! Phase 4: status + diff panels (ratatui).
 
-use crate::app::{App, Focus, Mode, VisualSel, LLM_FIELD_LABELS};
+use crate::app::{App, Focus, HitMap, Mode, VisualSel, LLM_FIELD_LABELS, LLM_PICKER_ROWS};
 use crate::config::Theme;
 use crate::markdown::render_markdown;
 use crate::syntax::{highlight_line, HiToken};
@@ -78,6 +78,16 @@ fn selection_style(theme: Theme) -> Style {
 fn cursor_highlight(line: &mut Line<'static>, theme: Theme) {
     for span in &mut line.spans {
         span.style = span.style.bg(theme.selection_bg);
+    }
+}
+
+/// Slight highlight for the rest of the hunk under the cursor: bold text
+/// only, so the red/green diff washes and syntax colors survive (the
+/// cursor row itself keeps the full selection wash). Makes the active
+/// hunk read as one block without hiding what changed.
+fn hunk_highlight(line: &mut Line<'static>) {
+    for span in &mut line.spans {
+        span.style = span.style.add_modifier(Modifier::BOLD);
     }
 }
 
@@ -269,12 +279,9 @@ pub fn render(frame: &mut Frame, app: &App) {
         Block::default().style(Style::default().bg(app.theme().bg)),
         area,
     );
-    let footer_len = if app.error().is_some() || app.notice().is_some() {
-        2
-    } else {
-        1
-    };
-    let layout = compute_layout(area, footer_len);
+    // Two-line footer: mouse buttons + keyboard hints.
+    let layout = compute_layout(area, 2, app.layout_overrides());
+    app.set_last_layout(layout);
 
     render_status_panel(frame, layout.status, app);
     render_files_panel(frame, layout.files, app);
@@ -336,12 +343,9 @@ pub fn render_workspace(frame: &mut Frame, ws: &Workspace) {
     };
     render_project_bar(frame, bar, ws);
     let app = ws.current();
-    let footer_len = if app.error().is_some() || app.notice().is_some() {
-        2
-    } else {
-        1
-    };
-    let layout = compute_layout(body, footer_len);
+    // Two-line footer: mouse buttons + keyboard hints.
+    let layout = compute_layout(body, 2, app.layout_overrides());
+    app.set_last_layout(layout);
 
     render_status_panel(frame, layout.status, app);
     render_files_panel(frame, layout.files, app);
@@ -379,24 +383,31 @@ pub fn render_workspace(frame: &mut Frame, ws: &Workspace) {
 }
 
 /// One tab per project: `1:name (dirty)`, highlighted when active.
+/// Tab screen columns are recorded on the workspace for mouse clicks.
 fn render_project_bar(frame: &mut Frame, area: Rect, ws: &Workspace) {
     if area.is_empty() {
         return;
     }
     let theme = ws.theme();
     let mut spans = Vec::new();
+    let mut hit: Vec<(u16, u16, usize)> = Vec::new();
+    let mut x = area.x.saturating_add(1);
     for i in 0..ws.len() {
         let dirty = ws
             .project_dirty_count(i)
             .map(|n| n.to_string())
             .unwrap_or_else(|| "…".to_string());
         let label = format!(" {}:{} ({}) ", i + 1, ws.project_name(i), dirty);
+        let w = label.width() as u16;
+        hit.push((x, x.saturating_add(w), i));
+        x = x.saturating_add(w);
         if i == ws.index() {
             spans.push(Span::styled(label, selection_style(theme)));
         } else {
             spans.push(Span::styled(label, Style::default().fg(theme.hint)));
         }
     }
+    ws.set_bar_hit(hit, area.y.saturating_add(1));
     frame.render_widget(
         Paragraph::new(Line::from(spans)).block(panel_block(
             false,
@@ -409,6 +420,7 @@ fn render_project_bar(frame: &mut Frame, area: Rect, ws: &Workspace) {
 
 /// Geometry of the screen. Pure function of the area so tests can predict
 /// panel corners with the same math the renderer uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ScreenLayout {
     pub status: Rect,
     pub files: Rect,
@@ -419,7 +431,31 @@ pub(crate) struct ScreenLayout {
     pub footer: Rect,
 }
 
-pub(crate) fn compute_layout(area: Rect, footer_h: u16) -> ScreenLayout {
+/// Mouse-driven size overrides. `rail_w` replaces the default 30%-capped
+/// rail width; `heights[i]` replaces the default height of the i-th rail
+/// panel (status, files, branches, commits, stash). `None` means default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct LayoutOverrides {
+    pub rail_w: Option<u16>,
+    pub heights: [Option<u16>; 5],
+}
+
+/// Minimum widths/heights so a drag can never collapse a panel away.
+pub(crate) const MIN_RAIL_W: u16 = 20;
+pub(crate) const MAX_RAIL_W: u16 = 60;
+pub(crate) const MIN_PANEL_H: u16 = 3;
+
+fn default_rail_w(area_width: u16) -> u16 {
+    (area_width / 10 * 3 + area_width % 10 * 3 / 10)
+        .min(44)
+        .min(area_width)
+}
+
+pub(crate) fn compute_layout(
+    area: Rect,
+    footer_h: u16,
+    overrides: LayoutOverrides,
+) -> ScreenLayout {
     let footer_h = footer_h.min(area.height);
     let body_h = area.height - footer_h;
     let footer = Rect {
@@ -428,9 +464,15 @@ pub(crate) fn compute_layout(area: Rect, footer_h: u16) -> ScreenLayout {
         width: area.width,
         height: footer_h,
     };
-    let rail_w = (area.width / 10 * 3 + area.width % 10 * 3 / 10)
-        .min(44)
-        .min(area.width);
+    let rail_w = overrides
+        .rail_w
+        .unwrap_or_else(|| default_rail_w(area.width))
+        .clamp(MIN_RAIL_W.min(area.width), area.width)
+        .min(
+            area.width
+                .saturating_sub(20)
+                .max(MIN_RAIL_W.min(area.width)),
+        );
     let rail = Rect {
         x: area.x,
         y: area.y,
@@ -443,12 +485,23 @@ pub(crate) fn compute_layout(area: Rect, footer_h: u16) -> ScreenLayout {
         width: area.width - rail_w,
         height: body_h,
     };
-    let sizes = [3, body_h.saturating_sub(16).max(3), 5, 4, 4];
+    let defaults = [3, body_h.saturating_sub(16).max(3), 5, 4, 4];
+    let mut wants = defaults;
+    for (i, o) in overrides.heights.iter().enumerate() {
+        if let Some(h) = o {
+            wants[i] = (*h).max(MIN_PANEL_H);
+        }
+    }
     let mut rects = Vec::with_capacity(5);
     let mut y = rail.y;
     let end = rail.y + rail.height;
-    for want in sizes {
-        let h = (y + want).min(end).saturating_sub(y);
+    for (i, want) in wants.iter().enumerate() {
+        let h = if i == 4 {
+            // Last panel takes whatever is left so the rail is seamless.
+            end.saturating_sub(y)
+        } else {
+            (y + *want).min(end).saturating_sub(y)
+        };
         rects.push(Rect {
             x: rail.x,
             y,
@@ -466,6 +519,19 @@ pub(crate) fn compute_layout(area: Rect, footer_h: u16) -> ScreenLayout {
         diff: preview,
         footer,
     }
+}
+
+/// Screen column of the draggable vertical divider between the left rail
+/// and the diff preview (the rail's right border column).
+pub(crate) fn rail_divider_x(layout: &ScreenLayout) -> u16 {
+    layout.diff.x
+}
+
+/// Screen rows of the draggable horizontal dividers between rail panels:
+/// the bottom border row of every rail panel except the last.
+pub(crate) fn panel_divider_ys(layout: &ScreenLayout) -> [u16; 4] {
+    let panels = [layout.status, layout.files, layout.branches, layout.commits];
+    panels.map(|r| r.y.saturating_add(r.height.saturating_sub(1)))
 }
 
 /// Minimal-scroll follow: keep `selected` visible inside a `visible`-row
@@ -839,6 +905,24 @@ pub(crate) fn rows_hunk_start(rows: &[DiffRow], index: usize) -> u16 {
         .position(|r| matches!(r, DiffRow::Header { index: i } if *i == index))
         .unwrap_or(0)
         .min(u16::MAX as usize) as u16
+}
+
+/// Row range `[start, end)` belonging to hunk `index` (its header row
+/// through the row before the next hunk header). `None` when the hunk has
+/// no header row (e.g. no diff loaded). Used to wash the hunk under the
+/// cursor so the active hunk reads as one block.
+pub(crate) fn hunk_row_range(rows: &[DiffRow], index: usize) -> Option<(usize, usize)> {
+    let start = rows
+        .iter()
+        .position(|r| matches!(r, DiffRow::Header { index: i } if *i == index))?;
+    let mut end = rows.len();
+    for (i, r) in rows.iter().enumerate().skip(start + 1) {
+        if matches!(r, DiffRow::Header { .. }) {
+            end = i;
+            break;
+        }
+    }
+    Some((start, end))
 }
 
 /// Logical text under the nvim-style block cursor: the hunk header for
@@ -1416,6 +1500,9 @@ fn render_unified_row(
 /// `visual` is active, in which case the selection treatment wins
 /// (nvim-like) and the block alone marks the cursor. `visual` is
 /// `((r1, c1), (r2, c2), linewise)`; see `visual_row_wash`.
+/// `active` is the row range `[start, end)` of the hunk under the cursor:
+/// those rows get the same wash so the active hunk reads as one block
+/// (the block cursor still marks the exact cursor row).
 #[allow(clippy::too_many_arguments)]
 fn render_unified_lines(
     diff: &FileDiff,
@@ -1426,7 +1513,8 @@ fn render_unified_lines(
     take: usize,
     cursor: Option<(usize, usize)>,
     visual: Option<VisualSel>,
-) -> (Vec<Line<'static>>, usize) {
+    active: Option<(usize, usize)>,
+) -> (Vec<Line<'static>>, usize, Vec<usize>) {
     let gutter_w = gutter_width(rows);
     let total: usize = rows_unified_len(rows);
     let (crow, ccol, c_start, c_end) = cursor
@@ -1449,6 +1537,9 @@ fn render_unified_lines(
         None
     };
     let mut out = Vec::new();
+    // `diff_rows` index per emitted visual line, so mouse clicks land on
+    // exactly the row the user saw (wrapping included).
+    let mut hit: Vec<usize> = Vec::new();
     let mut logical = 0;
     'rows: for (idx, row) in rows.iter().enumerate() {
         // (block display col for this row, if it is the cursor row; the
@@ -1462,6 +1553,7 @@ fn render_unified_lines(
         let rwash = visual
             .map(|s| visual_row_wash(diff, rows, idx, s, gutter_w))
             .unwrap_or(RowWash::None);
+        let in_active = active.is_some_and(|(s, e)| idx >= s && idx < e) && visual.is_none();
         for visual_group in render_unified_row(diff, row, gutter_w, width, theme, ccol) {
             if logical < skip {
                 logical += 1;
@@ -1469,6 +1561,9 @@ fn render_unified_lines(
             }
             let cursor_hl = logical >= c_start && logical < c_end;
             let hl = (cursor_hl && visual.is_none()) || rwash == RowWash::Full;
+            // Slight bold for the rest of the active hunk (not the cursor
+            // row itself, which already has the full wash).
+            let hunk_hl = in_active && !cursor_hl;
             logical += 1;
             // Selection edges wash the first visual row only; wrapped
             // continuations stay plain. Content starts after the 2-cell
@@ -1490,17 +1585,20 @@ fn render_unified_lines(
                 let mut vline = vline;
                 if hl {
                     cursor_highlight(&mut vline, theme);
+                } else if hunk_hl {
+                    hunk_highlight(&mut vline);
                 }
                 if vi == 0 {
                     if let Some((s, e)) = edge {
                         wash_cell_range(&mut vline, s, e, theme);
                     }
                 }
+                hit.push(idx);
                 out.push(vline);
             }
         }
     }
-    (out, total)
+    (out, total, hit)
 }
 
 /// Inline single-column diff preview of the selected file on the right.
@@ -1576,7 +1674,7 @@ fn render_diff_preview_panel(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         inner_h
     };
-    let (mut shown, _) = render_unified_lines(
+    let (mut shown, _, mut hit) = render_unified_lines(
         diff,
         rows,
         theme,
@@ -1585,6 +1683,13 @@ fn render_diff_preview_panel(frame: &mut Frame, area: Rect, app: &App) {
         take.max(1),
         Some((app.cursor_row(), app.cursor_col())),
         app.visual_selection(),
+        // Wash the hunk under the cursor so it reads as one block. Whole-
+        // file views are a single hunk covering everything: no wash there.
+        if app.diff_whole_file() {
+            None
+        } else {
+            hunk_row_range(rows, app.hunk())
+        },
     );
     let remaining = total.saturating_sub(off + shown.len());
     if remaining > 0 && !shown.is_empty() {
@@ -1596,8 +1701,19 @@ fn render_diff_preview_panel(frame: &mut Frame, area: Rect, app: &App) {
         // newest, so context above stays stable.
         if shown.len() > inner_h {
             shown.remove(0);
+            if !hit.is_empty() {
+                hit.remove(0);
+            }
         }
     }
+    // Record screen-row → diff-row hits for mouse clicks (border offset 1).
+    app.set_hit(
+        HitMap::Preview,
+        hit.into_iter()
+            .enumerate()
+            .map(|(i, r)| (area.y.saturating_add(1).saturating_add(i as u16), r))
+            .collect(),
+    );
     frame.render_widget(
         Paragraph::new(shown).block(panel_block(focused, theme, title)),
         area,
@@ -1621,6 +1737,8 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             " Full diff ".to_string()
         };
+        app.set_hit(HitMap::Full, Vec::new());
+        app.set_last_full_rect(area, u16::MAX);
         frame.render_widget(
             Paragraph::new("").block(panel_block(true, theme, title)),
             area,
@@ -1645,6 +1763,8 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
             .skip(off)
             .take(inner_h.max(1))
             .collect();
+        app.set_hit(HitMap::Full, Vec::new());
+        app.set_last_full_rect(area, u16::MAX);
         frame.render_widget(
             Paragraph::new(shown).block(panel_block(true, theme, title)),
             area,
@@ -1660,6 +1780,8 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
         format!(" Full diff: {} (unstaged) ", diff.path)
     };
     if diff.hunks.is_empty() {
+        app.set_hit(HitMap::Full, Vec::new());
+        app.set_last_full_rect(area, u16::MAX);
         frame.render_widget(
             Paragraph::new(empty_diff_text(diff)).block(panel_block(true, theme, title)),
             area,
@@ -1673,6 +1795,9 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
     // (large whole-file views stay fast).
     let inner = area.width.saturating_sub(2) as usize;
     let inner_h = area.height.saturating_sub(2) as usize;
+    // Last inner line is a clickable button bar (`[Stage hunk] …`), so the
+    // mouse works fullscreen too (the main footer sits behind the overlay).
+    let diff_h = inner_h.saturating_sub(1).max(1);
     let half = inner.saturating_sub(1) / 2;
     let right_w = inner.saturating_sub(half + 1);
     // Rows are cached in `App` when the diff arrives: scrolling/highlighting
@@ -1683,20 +1808,32 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
     let path = diff.path.as_str();
     let divider_style = Style::default().fg(theme.line_nr).bg(theme.bg);
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_h);
+    // Screen-row → diff-row hits for mouse clicks (one entry per visual
+    // line; wrapped continuations map to their row).
+    let mut hit: Vec<(u16, usize)> = Vec::with_capacity(inner_h);
+    let hit_y = |n: usize| area.y.saturating_add(1).saturating_add(n as u16);
     let cursor = app.cursor_row();
     // No cursor/selection wash over the Markdown preview (plain scrolling
     // there). The renderer also records the viewport height for the
     // cursor-follow math in `App`.
     let show_cursor = !app.show_markdown_preview();
-    app.set_full_view_h(inner_h);
+    app.set_full_view_h(diff_h);
     // Active visual selection, if any: ((r1,c1), (r2,c2), linewise).
     let vis = if show_cursor {
         app.visual_selection()
     } else {
         None
     };
+    // Rows of the hunk under the cursor: washed so the active hunk reads
+    // as one block (the block cursor still marks the exact row). Whole-
+    // file views are a single hunk covering everything: no wash there.
+    let active = if show_cursor && !app.diff_whole_file() {
+        hunk_row_range(rows, app.hunk())
+    } else {
+        None
+    };
     'rows: for (ri, row) in rows.iter().skip(off).enumerate() {
-        if lines.len() >= inner_h {
+        if lines.len() >= diff_h {
             break;
         }
         let idx = off + ri;
@@ -1707,6 +1844,10 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
             .map(|s| visual_row_wash(diff, rows, idx, s, gutter_w))
             .unwrap_or(RowWash::None);
         let full_wash = (at_cursor && vis.is_none()) || row_wash == RowWash::Full;
+        // Slight bold for the rest of the active hunk (not the cursor row,
+        // which already has the full wash; not while selecting).
+        let hunk_wash =
+            !at_cursor && vis.is_none() && active.is_some_and(|(s, e)| idx >= s && idx < e);
         match row {
             DiffRow::Header { index } => {
                 let selected = *index == app.hunk();
@@ -1730,6 +1871,8 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
                 )]);
                 if full_wash {
                     cursor_highlight(&mut line, theme);
+                } else if hunk_wash {
+                    hunk_highlight(&mut line);
                 }
                 // Header text starts after the 2-cell marker.
                 if let RowWash::Partial { start, end } = row_wash {
@@ -1743,6 +1886,7 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
                         }
                     }
                 }
+                hit.push((hit_y(lines.len()), idx));
                 lines.push(line);
             }
             DiffRow::Split { left, right } => {
@@ -1783,12 +1927,14 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
                             .into_iter()
                             .enumerate()
                         {
-                            if lines.len() >= inner_h {
+                            if lines.len() >= diff_h {
                                 break 'rows;
                             }
                             let mut line = Line::from(spans);
                             if full_wash {
                                 cursor_highlight(&mut line, theme);
+                            } else if hunk_wash {
+                                hunk_highlight(&mut line);
                             }
                             // First visual row only; wrapped continuations
                             // stay plain (documented limitation).
@@ -1797,6 +1943,7 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
                                     wash_cell_range(&mut line, s, e, theme);
                                 }
                             }
+                            hit.push((hit_y(lines.len()), idx));
                             lines.push(line);
                         }
                     } else {
@@ -1813,18 +1960,21 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
                                 .into_iter()
                                 .enumerate()
                             {
-                                if lines.len() >= inner_h {
+                                if lines.len() >= diff_h {
                                     break 'rows;
                                 }
                                 let mut line = Line::from(spans);
                                 if full_wash {
                                     cursor_highlight(&mut line, theme);
+                                } else if hunk_wash {
+                                    hunk_highlight(&mut line);
                                 }
                                 if i == 0 {
                                     if let Some((s, e)) = e {
                                         wash_cell_range(&mut line, s, e, theme);
                                     }
                                 }
+                                hit.push((hit_y(lines.len()), idx));
                                 lines.push(line);
                             }
                         }
@@ -1846,7 +1996,7 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
                         .next()
                         .unwrap_or_default();
                 for i in 0..height {
-                    if lines.len() >= inner_h {
+                    if lines.len() >= diff_h {
                         break 'rows;
                     }
                     let mut spans = left_rows
@@ -1863,6 +2013,8 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
                     let mut line = Line::from(spans);
                     if full_wash {
                         cursor_highlight(&mut line, theme);
+                    } else if hunk_wash {
+                        hunk_highlight(&mut line);
                     }
                     // Selection edges wash the first visual row only;
                     // wrapped continuations stay plain.
@@ -1878,24 +2030,56 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
                             }
                         }
                     }
+                    hit.push((hit_y(lines.len()), idx));
                     lines.push(line);
                 }
             }
         }
     }
+    // Clickable button bar on the last inner line (the main footer sits
+    // behind this overlay). Buttons share [`footer_buttons`] so clicks and
+    // keys stay in lockstep.
+    let mut btn_spans = Vec::new();
+    for (label, _) in footer_buttons(app) {
+        btn_spans.push(Span::styled(
+            format!("[{label}] "),
+            Style::default()
+                .fg(theme.border_focused)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    btn_spans.push(Span::styled(
+        "click a row to move · click its hunk header to jump".to_string(),
+        Style::default().fg(theme.hint),
+    ));
+    let btn_y = hit_y(lines.len());
+    lines.push(Line::from(btn_spans));
+    app.set_hit(HitMap::Full, hit);
+    app.set_last_full_rect(area, btn_y);
     frame.render_widget(
         Paragraph::new(lines).block(panel_block(true, theme, title)),
         area,
     );
 }
 
+/// Two-line footer: clickable mouse buttons on top, keyboard hints (or
+/// the error/notice line) below. Degenerate heights show buttons first.
 fn render_footer(frame: &mut Frame, area: Rect, app: &App, multi: bool) {
+    if area.is_empty() {
+        return;
+    }
+    let theme = app.theme();
+    if area.height < 2 {
+        frame.render_widget(footer_buttons_line(app, theme), area);
+        return;
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(area);
+    frame.render_widget(footer_buttons_line(app, theme), chunks[0]);
     let theme = app.theme();
     if let Some(err) = app.error() {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1)])
-            .split(area);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(
@@ -1906,14 +2090,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App, multi: bool) {
                 ),
                 Span::styled(err, Style::default().fg(theme.error)),
             ])),
-            chunks[0],
+            chunks[1],
         );
-        frame.render_widget(footer_hints(app, theme, multi), chunks[1]);
     } else if let Some(note) = app.notice() {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1)])
-            .split(area);
         frame.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
                 note.to_string(),
@@ -1921,12 +2100,30 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App, multi: bool) {
                     .fg(theme.branch_current)
                     .add_modifier(Modifier::BOLD),
             )])),
-            chunks[0],
+            chunks[1],
         );
-        frame.render_widget(footer_hints(app, theme, multi), chunks[1]);
     } else {
-        frame.render_widget(footer_hints(app, theme, multi), area);
+        frame.render_widget(footer_hints(app, theme, multi), chunks[1]);
     }
+}
+
+/// Clickable button bar (`[Stage] [Discard] …`). Shares [`footer_buttons`]
+/// with the hit-testing so clicks and rendering stay in lockstep.
+fn footer_buttons_line(app: &App, theme: Theme) -> Paragraph<'static> {
+    let mut spans = Vec::new();
+    for (label, _) in footer_buttons(app) {
+        spans.push(Span::styled(
+            format!("[{label}] "),
+            Style::default()
+                .fg(theme.border_focused)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::styled(
+        "click or press the key".to_string(),
+        Style::default().fg(theme.hint),
+    ));
+    Paragraph::new(Line::from(spans))
 }
 
 fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
@@ -1942,7 +2139,7 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
         Mode::SetUpstream => "←/→ move · Home/End jump · Del deletes · Enter push -u · Esc cancel",
         Mode::SetRemote => "←/→ move · Home/End jump · Del deletes · Enter add origin + push · Esc cancel",
         Mode::FullDiff => {
-            "j/k/↑/↓ line · h/l/←/→ col · J/K hunk · 0/Home/End · v/V select · y yank · space stage hunk · d discard file · PgUp/PgDn page · m preview · / find · p pull · P push · esc leave/close · q close · Q quit"
+            "j/k/↑/↓ line · h/l/←/→ col · J/K hunk · 0/Home/End · v/V select · y yank · space stage hunk · x restore hunk · d discard file · PgUp/PgDn page · m preview · / find · p pull · P push · esc leave/close · q close · Q quit"
         }
         Mode::Normal if app.focus() == Focus::Branches => {
             "enter checkout · a new branch · D delete · tab commits · q close · Q quit"
@@ -1952,10 +2149,10 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
             "enter pop · a stash · D drop · tab files · q close · Q quit"
         }
         Mode::Normal if app.focus() == Focus::Diff => {
-            "j/k/↑/↓ line · h/l col · v/V select · y yank · PgUp/PgDn page · enter full screen · ←/1 files · tab files · q close · Q quit"
+            "j/k/↑/↓ line · J/K hunk · h/l col · v/V select · y yank · x restore hunk · PgUp/PgDn page · enter full screen · ←/1 files · tab files · q close · Q quit"
         }
         Mode::FindFile => "type to filter · ↑/↓ move · ←/→ edit · enter open · esc cancel",
-        Mode::LlmSettings => "tab/↑↓ switch field · ←/→ edit · enter save · esc cancel",
+        Mode::LlmSettings => "tab/↑↓ switch field · ←/→ choose/edit · enter save · esc cancel",
         Mode::OpenProject => {
             "type to filter · ↑/↓ move · enter open/descend · → descend · ← up · tab jump to path · esc clear/close"
         }
@@ -1979,6 +2176,87 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
         format!("{vis}{base}{switch}"),
         Style::default().fg(theme.hint),
     ))
+}
+
+/// Clickable footer buttons: mouse users get the core actions without
+/// memorizing keys. Mirrors the keyboard bindings for the current
+/// mode/focus; see [`App::click_footer_button`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FooterAction {
+    Stage,
+    Discard,
+    Commit,
+    Pull,
+    Push,
+    Find,
+    OpenDiff,
+    CloseDiff,
+    StageHunk,
+    RestoreHunk,
+    Checkout,
+    NewBranch,
+    DeleteBranch,
+    StashPop,
+    StashPush,
+    StashDrop,
+}
+
+pub(crate) fn footer_buttons(app: &App) -> Vec<(&'static str, FooterAction)> {
+    use FooterAction::*;
+    match app.mode() {
+        Mode::FullDiff => vec![
+            ("Stage hunk", StageHunk),
+            ("Restore hunk", RestoreHunk),
+            ("Discard file", Discard),
+            ("Close", CloseDiff),
+            ("Find", Find),
+            ("Pull", Pull),
+            ("Push", Push),
+        ],
+        Mode::Normal if app.focus() == Focus::Branches => vec![
+            ("Checkout", Checkout),
+            ("New", NewBranch),
+            ("Delete", DeleteBranch),
+            ("Find", Find),
+        ],
+        Mode::Normal if app.focus() == Focus::Stash => vec![
+            ("Pop", StashPop),
+            ("Stash", StashPush),
+            ("Drop", StashDrop),
+            ("Find", Find),
+        ],
+        Mode::Normal if app.focus() == Focus::Diff => vec![
+            ("Stage hunk", StageHunk),
+            ("Restore hunk", RestoreHunk),
+            ("Full screen", OpenDiff),
+            ("Find", Find),
+        ],
+        Mode::Normal => vec![
+            ("Stage", Stage),
+            ("Discard", Discard),
+            ("Commit", Commit),
+            ("Pull", Pull),
+            ("Push", Push),
+            ("Find", Find),
+            ("Diff", OpenDiff),
+        ],
+        _ => vec![("Find", Find)],
+    }
+}
+
+/// Which footer button (if any) sits at the zero-based cell offset `x`
+/// into the footer line. Must stay in lockstep with [`footer_hints`]:
+/// each button renders as `[label] ` (label bytes + 3 cells).
+pub(crate) fn footer_button_at(buttons: &[(&str, FooterAction)], x: usize) -> Option<FooterAction> {
+    let mut off = 0usize;
+    for (label, action) in buttons {
+        let w = label.len() + 3; // '[' + label + ']' + ' '
+        if x >= off && x < off + w {
+            return Some(*action);
+        }
+        off += w;
+    }
+    None
 }
 
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
@@ -2069,7 +2347,13 @@ fn render_finder_modal(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(theme.hint),
         ));
     }
+    // Screen-row → match-position hits for mouse clicks.
+    let mut hit: Vec<(u16, usize)> = Vec::new();
     for (row, &index) in matches.iter().skip(start).take(rows).enumerate() {
+        hit.push((
+            popup.y.saturating_add(1).saturating_add(lines.len() as u16),
+            start + row,
+        ));
         let selected = start + row == cursor;
         let (text, line_style) = match app.file_entry(index) {
             Some(entry) => {
@@ -2097,6 +2381,7 @@ fn render_finder_modal(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(" ".repeat(pad), line_style),
         ]));
     }
+    app.set_hit(HitMap::Finder, hit);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
     // Cursor inside the (possibly scrolled) query text.
     let cursor_x = popup.x + 1 + 2 + query_cursor as u16;
@@ -2118,11 +2403,15 @@ fn commit_title(app: &App) -> &'static str {
 }
 
 /// LLM setup form (`A` in the file list): four labeled rows (provider,
-/// model, API key, base URL). The selected row highlights and scrolls
-/// horizontally with the cursor; Enter saves to the config file.
+/// model, API key, base URL). The provider row is an option picker
+/// (`←/→` steps through it, value framed by `‹ ›`); the model row cycles
+/// the list the provider reports, so it is framed the same way once that
+/// fetch lands and plain text until then. A line under the rows reports
+/// the fetch state. Enter saves to the config file.
 fn render_llm_modal(frame: &mut Frame, area: Rect, app: &App) {
     let theme = app.theme();
-    let popup = centered_rect(area, 76, 8);
+    // 2 borders + 4 rows + status line + blank + keymap.
+    let popup = centered_rect(area, 76, 10);
     frame.render_widget(Clear, popup);
     frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), popup);
     let block = panel_block(
@@ -2136,14 +2425,22 @@ fn render_llm_modal(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_h);
     let mut cursor_col = 0;
     let mut cursor_row = 0;
+    // Cells between the start of the value and the cursor: `> Label: ` plus
+    // the `‹ ` on picker rows.
+    let mut cursor_prefix = 0usize;
     for (i, label) in LLM_FIELD_LABELS.iter().enumerate() {
         let selected = i == sel;
+        let picker = LLM_PICKER_ROWS.contains(&i) && !app.llm_row_options(i).is_empty();
+        let open = if picker { "‹ " } else { "" };
+        let close = if picker { " ›" } else { "" };
         let value = app.llm_field_value(i).to_string();
-        let width = inner_w.saturating_sub(label.len() + 4);
+        let chrome = open.len() + close.len();
+        let width = inner_w.saturating_sub(label.len() + 4 + chrome);
         let (visible, col) = input_window(&value, app.draft_cursor(), width.max(1));
         if selected {
             cursor_col = col;
             cursor_row = lines.len();
+            cursor_prefix = 2 + label.len() + 2 + open.len();
         }
         let marker = if selected { "> " } else { "  " };
         let prefix = format!("{marker}{label}: ");
@@ -2152,19 +2449,40 @@ fn render_llm_modal(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             Style::default().fg(theme.fg).bg(theme.bg)
         };
-        let used = prefix.width() + visible.width();
+        let used = prefix.width() + open.width() + visible.width() + close.width();
         let pad = inner_w.saturating_sub(used);
         lines.push(Line::from(vec![
             Span::styled(marker.to_string(), style),
             Span::styled(label.to_string(), style),
             Span::styled(": ".to_string(), style),
+            Span::styled(open.to_string(), style),
             Span::styled(visible, style),
+            Span::styled(close.to_string(), style),
             Span::styled(" ".repeat(pad), style),
         ]));
     }
+    // Model-list status: the row above is always editable text, so say
+    // here whether the provider's list is on the way, arrived, or failed.
+    if app.llm_models_loading() {
+        lines.push(Line::from(Span::styled(
+            " fetching models from the provider…",
+            Style::default().fg(theme.hint).bg(theme.bg),
+        )));
+    } else if let Some(err) = app.llm_models_error() {
+        lines.push(Line::from(Span::styled(
+            format!(" could not list models: {err}"),
+            Style::default().fg(theme.error).bg(theme.bg),
+        )));
+    }
+    // One-line keymap inside the box, so the pickers are discoverable
+    // without leaving the form.
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " ←/→ choose provider/model · type a custom id · enter save · esc cancel",
+        Style::default().fg(theme.hint).bg(theme.bg),
+    )));
     frame.render_widget(Paragraph::new(lines).block(block), popup);
-    let prefix_len = 2 + LLM_FIELD_LABELS[sel].len() + 2;
-    let cursor_x = popup.x + 1 + prefix_len as u16 + cursor_col as u16;
+    let cursor_x = popup.x + 1 + cursor_prefix as u16 + cursor_col as u16;
     let cursor_y = popup.y + 1 + cursor_row as u16;
     if cursor_x < popup.x + popup.width.saturating_sub(1) {
         frame.set_cursor_position((cursor_x, cursor_y));
@@ -2458,7 +2776,13 @@ fn render_open_browser_modal(
     let cursor = browser.selected.min(total.saturating_sub(1));
     let rows = inner_h.saturating_sub(lines.len());
     let start = cursor.saturating_sub(rows.saturating_sub(1)).min(total);
+    // Screen-row → browser-list-index hits for mouse clicks.
+    let mut hit: Vec<(u16, usize)> = Vec::new();
     for (row, index) in (start..total).take(rows).enumerate() {
+        hit.push((
+            popup.y.saturating_add(1).saturating_add(lines.len() as u16),
+            start + row,
+        ));
         let selected = start + row == cursor;
         let style = if selected {
             selection_style(theme)
@@ -2518,6 +2842,7 @@ fn render_open_browser_modal(
         ));
         lines.push(Line::from(spans));
     }
+    app.set_hit(HitMap::Browser, hit);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
     if browser.editing_path {
         let (_, col) = input_window(
@@ -2923,6 +3248,8 @@ mod tests {
             assert!(s.contains(label), "field {label} missing:\n{s}");
         }
         assert!(s.contains("openai"), "prefilled provider missing:\n{s}");
+        assert!(s.contains("‹"), "picker framing missing:\n{s}");
+        assert!(s.contains("←/→ choose"), "in-modal keymap missing:\n{s}");
         assert!(s.contains("enter save"), "save hint missing:\n{s}");
     }
 
@@ -3115,13 +3442,92 @@ mod tests {
 
     #[test]
     fn compute_layout_gives_right_preview_most_space() {
-        let l = compute_layout(Rect::new(0, 0, 100, 32), 1);
+        let l = compute_layout(Rect::new(0, 0, 100, 32), 1, LayoutOverrides::default());
         assert_eq!(l.status, Rect::new(0, 0, 30, 3));
         assert_eq!(l.diff, Rect::new(30, 0, 70, 31));
         assert_eq!(l.files.x, 0);
         assert_eq!(l.files.width, 30);
         assert!(l.files.height >= 12);
         assert_eq!(l.footer, Rect::new(0, 31, 100, 1));
+    }
+
+    #[test]
+    fn layout_overrides_resize_rail_and_panels() {
+        let area = Rect::new(0, 0, 100, 32);
+        let l = compute_layout(
+            area,
+            2,
+            LayoutOverrides {
+                rail_w: Some(50),
+                heights: [None, Some(10), None, None, None],
+            },
+        );
+        assert_eq!(l.diff.x, 50, "preview must start at the dragged divider");
+        assert_eq!(l.files.height, 10);
+        // Rail stays seamless: panels tile the body with no gaps.
+        let total = l.status.height
+            + l.files.height
+            + l.branches.height
+            + l.commits.height
+            + l.stash.height;
+        assert_eq!(total, 30, "panels must tile the 30-row body");
+        // Defaults are untouched without overrides.
+        let d = compute_layout(area, 2, LayoutOverrides::default());
+        assert_eq!(d.diff.x, 30);
+    }
+
+    #[test]
+    fn divider_geometry_matches_layout() {
+        let l = compute_layout(Rect::new(0, 0, 100, 32), 2, LayoutOverrides::default());
+        assert_eq!(rail_divider_x(&l), l.diff.x);
+        let ys = panel_divider_ys(&l);
+        let panels = [l.status, l.files, l.branches, l.commits];
+        for (i, p) in panels.iter().enumerate() {
+            assert_eq!(
+                ys[i],
+                p.y + p.height - 1,
+                "divider {i} must be the panel bottom"
+            );
+            if i > 0 {
+                assert!(ys[i] > ys[i - 1], "dividers must run top to bottom");
+            }
+        }
+    }
+
+    #[test]
+    fn footer_buttons_match_mode_and_hit_testing() {
+        let (_dir, app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        let buttons = footer_buttons(&app);
+        assert!(
+            buttons.iter().any(|(_, a)| *a == FooterAction::Stage),
+            "file list must offer Stage: {buttons:?}"
+        );
+        // Buttons lay out as `[label] ` left to right.
+        assert_eq!(footer_button_at(&buttons, 0), Some(FooterAction::Stage));
+        assert_eq!(footer_button_at(&buttons, 7), Some(FooterAction::Stage));
+        assert_eq!(footer_button_at(&buttons, 8), Some(FooterAction::Discard));
+        assert_eq!(footer_button_at(&buttons, 10_000), None);
+    }
+
+    #[test]
+    fn fullscreen_renders_clickable_button_bar() {
+        use crossterm::event::KeyCode;
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        app.set_diff_for_test(sample_diff(), false);
+        app.on_key(KeyCode::Enter);
+        let s = screen(&app, 70, 16);
+        assert!(
+            s.contains("[Stage hunk]"),
+            "fullscreen must show clickable buttons:\n{s}"
+        );
+    }
+
+    #[test]
+    fn footer_renders_clickable_button_bar() {
+        let (_dir, app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        let s = screen(&app, 100, 28);
+        assert!(s.contains("[Stage]"), "footer must show buttons:\n{s}");
+        assert!(s.contains("[Find]"), "footer must show Find:\n{s}");
     }
 
     #[test]
@@ -4201,7 +4607,7 @@ mod tests {
         use crossterm::event::KeyCode;
         use ratatui::layout::Rect;
         let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
-        let layout = compute_layout(Rect::new(0, 0, 100, 32), 1);
+        let layout = compute_layout(Rect::new(0, 0, 100, 32), 1, LayoutOverrides::default());
         // Colors come from the active theme, not hard-coded legacy values.
         let (bright, dim) = (app.theme().border_focused, app.theme().border_unfocused);
         assert_ne!(bright, dim, "theme must distinguish focus");
@@ -4245,7 +4651,7 @@ mod tests {
         // Tokyo-night focused border is blue #7aa2f7, unfocused #3b4261 —
         // neither equals the legacy White/DarkGray. Status focus drives
         // the files list, so the files panel glows first.
-        let layout = compute_layout(Rect::new(0, 0, 100, 32), 1);
+        let layout = compute_layout(Rect::new(0, 0, 100, 32), 1, LayoutOverrides::default());
         let buf = render_buf(&app, 100, 32);
         assert_eq!(
             buf[(layout.files.x, layout.files.y)].fg,

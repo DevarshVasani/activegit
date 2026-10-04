@@ -37,6 +37,13 @@ pub enum AsyncJob {
         path: String,
         hunk_index: usize,
     },
+    /// Restore a single hunk (`staged = false` reverts the workdir hunk,
+    /// `staged = true` reverts the index hunk toward HEAD).
+    DiscardHunk {
+        path: String,
+        hunk_index: usize,
+        staged: bool,
+    },
     StageFile {
         path: String,
     },
@@ -96,6 +103,15 @@ pub enum AsyncJob {
     GenerateCommitMessage {
         llm: crate::llm::LlmConfig,
     },
+    /// Ask the provider which models it offers, for the setup form's
+    /// model row. Carries a config snapshot so the worker can build the
+    /// request (key and base URL are part of what the form is editing),
+    /// and the submitting form's request id so a late answer for an
+    /// abandoned config can be told apart from the current one.
+    FetchModels {
+        id: u64,
+        llm: crate::llm::LlmConfig,
+    },
 }
 
 /// Work results. All data owned.
@@ -114,6 +130,19 @@ pub enum AsyncResult {
     SyncStatus(SyncStatus),
     /// LLM-generated commit message draft (commit box fills `draft`).
     GeneratedMessage(String),
+    /// Model ids the provider offers, for the setup form's model row,
+    /// tagged with the [`AsyncJob::FetchModels`] request id that asked.
+    Models {
+        id: u64,
+        models: Vec<String>,
+    },
+    /// A model fetch failed (same id); the message goes next to the model
+    /// row instead of the global error line, since an unreachable provider
+    /// is not the user's mistake and the form stays usable.
+    ModelsError {
+        id: u64,
+        error: String,
+    },
     MutationDone,
     Error(GitError),
 }
@@ -218,6 +247,14 @@ fn execute(repo: &mut Repo, job: AsyncJob) -> AsyncResult {
             Ok(()) => AsyncResult::MutationDone,
             Err(e) => AsyncResult::Error(e),
         },
+        AsyncJob::DiscardHunk {
+            path,
+            hunk_index,
+            staged,
+        } => match repo.discard_hunk(&path, hunk_index, staged) {
+            Ok(()) => AsyncResult::MutationDone,
+            Err(e) => AsyncResult::Error(e),
+        },
         AsyncJob::Commit { message } => match repo.commit(&message) {
             Ok(_) => AsyncResult::MutationDone,
             Err(e) => AsyncResult::Error(e),
@@ -294,6 +331,13 @@ fn execute(repo: &mut Repo, job: AsyncJob) -> AsyncResult {
                 Err(e) => AsyncResult::Error(e),
             }
         }
+        AsyncJob::FetchModels { id, llm } => match crate::llm::fetch_models(&llm) {
+            Ok(models) => AsyncResult::Models { id, models },
+            Err(e) => AsyncResult::ModelsError {
+                id,
+                error: e.to_string(),
+            },
+        },
     }
 }
 

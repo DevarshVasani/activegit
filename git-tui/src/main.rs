@@ -11,7 +11,10 @@ mod workspace;
 
 use anyhow::{Context, Result};
 use config::{Config, Theme};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -72,7 +75,8 @@ fn main() -> Result<()> {
     // scratch buffer; on `LeaveAlternateScreen` the shell contents reappear.
     // All drawing from here on is just ANSI escape sequences (cursor moves,
     // colors) emitted by ratatui — you never write them by hand.
-    execute!(out, EnterAlternateScreen).context("cannot enter alternate screen")?;
+    execute!(out, EnterAlternateScreen, EnableMouseCapture)
+        .context("cannot enter alternate screen")?;
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend).context("cannot create terminal")?;
 
@@ -122,15 +126,34 @@ fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen);
+        let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture);
         original(info);
     }));
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) {
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    );
     let _ = terminal.show_cursor();
+}
+
+/// Map a crossterm mouse event to a workspace action. Only left-button
+/// press/drag/release and the wheel are handled; anything else (middle/
+/// right buttons, hover moves) is ignored so the keyboard stays primary.
+fn map_mouse(kind: MouseEventKind, col: u16, row: u16) -> Option<workspace::MouseAction> {
+    use workspace::MouseAction;
+    match kind {
+        MouseEventKind::Down(MouseButton::Left) => Some(MouseAction::Down(col, row)),
+        MouseEventKind::Drag(MouseButton::Left) => Some(MouseAction::Drag(col, row)),
+        MouseEventKind::Up(MouseButton::Left) => Some(MouseAction::Up),
+        MouseEventKind::ScrollUp => Some(MouseAction::ScrollUp(col, row)),
+        MouseEventKind::ScrollDown => Some(MouseAction::ScrollDown(col, row)),
+        _ => None,
+    }
 }
 
 /// Some terminals report Shift+letter as lowercase + SHIFT instead of the
@@ -221,27 +244,39 @@ fn run(
     let mut welcome_was_visible = workspace.welcome_visible();
     loop {
         if event::poll(Duration::from_millis(100)).context("cannot poll input")? {
-            if let Event::Key(key) = event::read().context("cannot read input")? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+            match event::read().context("cannot read input")? {
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    // Ctrl-C safety hatch: works even if the user rebinds `quit`
+                    // away from `q`, and in text modals where `q` is literal.
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(key.code, KeyCode::Char('c' | 'C'))
+                    {
+                        workspace.request_quit();
+                    } else {
+                        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                        workspace.on_key_with_modifiers(
+                            normalize_key(key.code, key.modifiers),
+                            // `normalize_key` folds Shift+a into `A`; the commit
+                            // box needs the original Shift state so a literal
+                            // `A` (caps lock) still types normally.
+                            shift
+                                || matches!(
+                                    normalize_key(key.code, key.modifiers),
+                                    KeyCode::Char('A')
+                                ),
+                        );
+                    }
                 }
-                // Ctrl-C safety hatch: works even if the user rebinds `quit`
-                // away from `q`, and in text modals where `q` is literal.
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(key.code, KeyCode::Char('c' | 'C'))
-                {
-                    workspace.request_quit();
-                } else {
-                    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-                    workspace.on_key_with_modifiers(
-                        normalize_key(key.code, key.modifiers),
-                        // `normalize_key` folds Shift+a into `A`; the commit
-                        // box needs the original Shift state so a literal
-                        // `A` (caps lock) still types normally.
-                        shift
-                            || matches!(normalize_key(key.code, key.modifiers), KeyCode::Char('A')),
-                    );
+                Event::Mouse(m) => {
+                    if let Some(action) = map_mouse(m.kind, m.column, m.row) {
+                        workspace.on_mouse(action);
+                    }
                 }
+                Event::Resize(_, _) => {}
+                _ => {}
             }
         }
         workspace.poll();
@@ -367,6 +402,38 @@ mod tests {
             config.theme.border_focused,
             ratatui::style::Color::Rgb(122, 162, 247)
         );
+    }
+
+    #[test]
+    fn mouse_events_map_to_workspace_actions() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        use workspace::MouseAction;
+        assert_eq!(
+            map_mouse(MouseEventKind::Down(MouseButton::Left), 3, 4),
+            Some(MouseAction::Down(3, 4))
+        );
+        assert_eq!(
+            map_mouse(MouseEventKind::Drag(MouseButton::Left), 3, 4),
+            Some(MouseAction::Drag(3, 4))
+        );
+        assert_eq!(
+            map_mouse(MouseEventKind::Up(MouseButton::Left), 3, 4),
+            Some(MouseAction::Up)
+        );
+        assert_eq!(
+            map_mouse(MouseEventKind::ScrollUp, 3, 4),
+            Some(MouseAction::ScrollUp(3, 4))
+        );
+        assert_eq!(
+            map_mouse(MouseEventKind::ScrollDown, 3, 4),
+            Some(MouseAction::ScrollDown(3, 4))
+        );
+        // Right button and hover moves stay keyboard-only.
+        assert_eq!(
+            map_mouse(MouseEventKind::Down(MouseButton::Right), 3, 4),
+            None
+        );
+        assert_eq!(map_mouse(MouseEventKind::Moved, 3, 4), None);
     }
 
     #[test]

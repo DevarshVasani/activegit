@@ -8,6 +8,22 @@ use git_tui_core::jobqueue::JobQueue;
 use git_tui_core::repo::Repo;
 use std::path::PathBuf;
 
+/// Mouse input, mapped from the terminal backend in `main` so this stays
+/// toolkit-agnostic and unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseAction {
+    /// Left-press at screen cell `(col, row)`.
+    Down(u16, u16),
+    /// Left-drag at screen cell `(col, row)`.
+    Drag(u16, u16),
+    /// Left-release.
+    Up,
+    /// Wheel-up at screen cell `(col, row)`.
+    ScrollUp(u16, u16),
+    /// Wheel-down at screen cell `(col, row)`.
+    ScrollDown(u16, u16),
+}
+
 pub struct Workspace {
     apps: Vec<App>,
     /// Canonicalized workdir roots parallel to `apps` (dedup + switching).
@@ -16,6 +32,10 @@ pub struct Workspace {
     config: Config,
     current: usize,
     quit: bool,
+    /// Project-tab click ranges `(x_start, x_end, tab)`, recorded while
+    /// rendering the project bar, plus its screen row.
+    bar_hit: std::cell::RefCell<Vec<(u16, u16, usize)>>,
+    bar_y: std::cell::Cell<u16>,
     /// First-run welcome overlay. Set once at startup; any dismiss key
     /// clears it and the binary persists the marker so it shows only once.
     show_welcome: bool,
@@ -39,6 +59,8 @@ impl Workspace {
             config,
             current: 0,
             quit: false,
+            bar_hit: std::cell::RefCell::new(Vec::new()),
+            bar_y: std::cell::Cell::new(0),
             show_welcome: false,
             session_path: None,
         };
@@ -396,6 +418,68 @@ impl Workspace {
 
     pub fn theme(&self) -> Theme {
         self.current().theme()
+    }
+
+    /// Recorded by the project-bar renderer for mouse clicks.
+    pub fn set_bar_hit(&self, hit: Vec<(u16, u16, usize)>, y: u16) {
+        *self.bar_hit.borrow_mut() = hit;
+        self.bar_y.set(y);
+    }
+
+    /// Route mouse input: the welcome overlay, project tabs, and the
+    /// project browser live here; everything else belongs to the
+    /// current project tab.
+    pub fn on_mouse(&mut self, action: MouseAction) {
+        if self.show_welcome {
+            if matches!(action, MouseAction::Down(..)) {
+                self.dismiss_welcome();
+            }
+            return;
+        }
+        // Project tabs (multi-project bar): click switches tabs.
+        if self.apps.len() > 1 {
+            if let MouseAction::Down(col, row) = action {
+                if row == self.bar_y.get() {
+                    let tab = self
+                        .bar_hit
+                        .borrow()
+                        .iter()
+                        .find(|(s, e, _)| col >= *s && col < *e)
+                        .map(|(_, _, i)| *i);
+                    if let Some(i) = tab {
+                        self.set_current(i);
+                        return;
+                    }
+                }
+            }
+        }
+        // The project browser needs workspace-level opens.
+        if self.current().mode() == Mode::OpenProject {
+            if let MouseAction::Down(_, row) = action {
+                self.click_browser(row);
+            }
+            return;
+        }
+        match action {
+            MouseAction::Down(col, row) => self.current_mut().on_mouse_down(col, row),
+            MouseAction::Drag(col, row) => self.current_mut().on_mouse_drag(col, row),
+            MouseAction::Up => self.current_mut().on_mouse_up(),
+            MouseAction::ScrollUp(col, row) => self.current_mut().on_wheel(col, row, true),
+            MouseAction::ScrollDown(col, row) => self.current_mut().on_wheel(col, row, false),
+        }
+    }
+
+    /// Click a project-browser row: select it, or activate it when it is
+    /// already selected (mouse double-click without a timer).
+    fn click_browser(&mut self, row: u16) {
+        let Some(idx) = self.current().browser_hit_at(row) else {
+            return;
+        };
+        if idx == self.current().browser_selected_index() {
+            self.open_selected();
+        } else {
+            self.current_mut().set_browser_selected(idx);
+        }
     }
 
     pub fn next(&mut self) {
@@ -1226,6 +1310,43 @@ mod tests {
         assert_eq!(ws.current().mode(), Mode::FullDiff);
         ws.on_key(KeyCode::Char('Q'));
         assert!(ws.should_quit(), "Q fullscreen must quit the app");
+    }
+
+    #[test]
+    fn project_tab_click_switches_tabs() {
+        use crate::ui::render_workspace;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let b = init_repo_with_file("b", "b.txt", "b\n");
+        let mut ws = Workspace::open(
+            vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            Config::default(),
+        )
+        .unwrap();
+        assert_eq!(ws.index(), 0);
+        // Render once so the tab click ranges are recorded.
+        let backend = TestBackend::new(170, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_workspace(f, &ws)).unwrap();
+        // Click inside the second tab's recorded range.
+        let (x0, x1, i) = ws.bar_hit.borrow()[1];
+        assert_eq!(i, 1);
+        ws.on_mouse(MouseAction::Down((x0 + x1) / 2, ws.bar_y.get()));
+        assert_eq!(ws.index(), 1);
+        // Clicking empty bar space switches nothing.
+        ws.on_mouse(MouseAction::Down(169, ws.bar_y.get()));
+        assert_eq!(ws.index(), 1);
+    }
+
+    #[test]
+    fn welcome_click_dismisses_overlay() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ws.set_show_welcome(true);
+        ws.on_mouse(MouseAction::Down(5, 5));
+        assert!(!ws.welcome_visible());
+        assert!(!ws.should_quit());
     }
 
     #[test]

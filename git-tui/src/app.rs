@@ -17,15 +17,24 @@ use std::cell::Cell;
 
 use crate::config::{Config, KeyBindings, Theme};
 use crate::fuzzy;
-use crate::ui::{cursor_line_text, diff_rows, visible_file_rows, wrap_draft, DiffRow, FileRow};
+use crate::ui::{
+    cursor_line_text, diff_rows, footer_button_at, footer_buttons, panel_divider_ys,
+    rail_divider_x, visible_file_rows, wrap_draft, DiffRow, FileRow, FooterAction, LayoutOverrides,
+    ScreenLayout,
+};
 
 /// Labels for the LLM setup form rows: provider, model, API key, base URL.
 pub const LLM_FIELD_LABELS: [&str; 4] = [
-    "Provider (openai|openrouter|ollama|anthropic|gemini|custom)",
+    "Provider",
     "Model",
     "API key (empty = use env var)",
     "Base URL (optional, custom only)",
 ];
+
+/// Row index of the two option pickers (provider, model) in the setup form.
+/// `←/→` cycle these rows through their option list; typing still works, so
+/// a custom id can be entered on either. Rows 2 and 3 are free text.
+pub const LLM_PICKER_ROWS: [usize; 2] = [0, 1];
 
 /// Input mode: normal list navigation, a fullscreen diff overlay, or a
 /// text-input modal.
@@ -84,6 +93,22 @@ pub struct App {
     llm_cursors: [usize; 4],
     /// Highlighted form row.
     llm_selected: usize,
+    /// Model ids the provider returned for the form's current provider,
+    /// fetched over HTTP (nothing is hardcoded per provider). Empty while
+    /// loading or when the fetch failed, which leaves the model row as
+    /// free text.
+    llm_models: Vec<String>,
+    /// A FetchModels job is in flight (the model row shows "loading…").
+    llm_models_loading: bool,
+    /// Why the last model fetch failed, shown inline in the form.
+    llm_models_error: Option<String>,
+    /// Identity of the provider/key/base-URL the in-flight (or last)
+    /// fetch belongs to, so an edit to one of those rows re-asks.
+    llm_models_target: String,
+    /// Id of the fetch the form is waiting on, bumped per request so a
+    /// late answer for an abandoned config is dropped instead of filling
+    /// the row with another provider's models.
+    llm_models_request: u64,
     /// Short repo name for the status panel (workdir basename).
     repo_name: String,
     status: Option<RepoStatus>,
@@ -187,6 +212,47 @@ pub struct App {
     /// — a whole-file view instead of hunks or vice versa — and costs an
     /// extra worker roundtrip.
     pending_diff_reload: bool,
+    /// Mouse-driven size overrides (drag the dividers): rail width plus
+    /// per-panel heights in the left rail. `None` means default.
+    layout_overrides: LayoutOverrides,
+    /// Divider drag in progress, if any. Set on left-press on a divider,
+    /// updated on drag events, cleared on release.
+    drag: Option<DragTarget>,
+    /// Last rendered main layout (recorded by the renderer, which only
+    /// gets `&App` — same pattern as `draft_wrap_width`). Drives mouse
+    /// hit-testing for panels, dividers, and footer buttons.
+    last_layout: Cell<Option<ScreenLayout>>,
+    /// Fullscreen diff pane geometry (recorded by its renderer): the pane
+    /// rect plus the screen row of its clickable button bar.
+    last_full_rect: Cell<Option<ratatui::layout::Rect>>,
+    last_full_btn_y: Cell<u16>,
+    /// Screen-row → content-row hit maps recorded while rendering, so
+    /// clicks land on exactly the row the user saw (wrapping included).
+    /// Fullscreen `(y, diff_rows index)`, preview `(y, diff_rows index)`,
+    /// finder `(y, position in finder_matches)`, browser `(y, browser
+    /// list index)`.
+    full_hit: std::cell::RefCell<Vec<(u16, usize)>>,
+    prev_hit: std::cell::RefCell<Vec<(u16, usize)>>,
+    finder_hit: std::cell::RefCell<Vec<(u16, usize)>>,
+    browser_hit: std::cell::RefCell<Vec<(u16, usize)>>,
+}
+
+/// Divider being dragged: the vertical rail/preview split, or the bottom
+/// edge of rail panel `i` (0 status, 1 files, 2 branches, 3 commits;
+/// the stash panel takes the remainder).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DragTarget {
+    RailV,
+    Panel(usize),
+}
+
+/// Which click hit map to read/record (see [`App::set_hit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HitMap {
+    Full,
+    Preview,
+    Finder,
+    Browser,
 }
 
 /// Nvim-style visual selection: charwise (`v`) or linewise (`V`).
@@ -199,6 +265,14 @@ pub(crate) enum VisualMode {
 /// Normalized visual selection `((start_row, start_col), (end_row,
 /// end_col), linewise)`; see `App::visual_selection`.
 pub(crate) type VisualSel = ((usize, usize), (usize, usize), bool);
+
+/// Whether screen cell `(col, row)` falls inside `rect`.
+fn mouse_in(col: u16, row: u16, rect: ratatui::layout::Rect) -> bool {
+    col >= rect.x
+        && col < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
 
 /// Visual anchor: the fixed end of the selection. The live end is the
 /// line cursor (`cursor`, `cursor_col`); see `App::visual_selection`.
@@ -437,6 +511,11 @@ impl App {
             llm_form: Default::default(),
             llm_cursors: [0; 4],
             llm_selected: 0,
+            llm_models: Vec::new(),
+            llm_models_loading: false,
+            llm_models_error: None,
+            llm_models_target: String::new(),
+            llm_models_request: 0,
             repo_name: "repo".into(),
             status: None,
             file_list: Vec::new(),
@@ -483,6 +562,15 @@ impl App {
             md_for: None,
             md_text: None,
             pending_diff_reload: false,
+            layout_overrides: LayoutOverrides::default(),
+            drag: None,
+            last_layout: Cell::new(None),
+            last_full_rect: Cell::new(None),
+            last_full_btn_y: Cell::new(0),
+            full_hit: std::cell::RefCell::new(Vec::new()),
+            prev_hit: std::cell::RefCell::new(Vec::new()),
+            finder_hit: std::cell::RefCell::new(Vec::new()),
+            browser_hit: std::cell::RefCell::new(Vec::new()),
         };
         app.refresh();
         app.preload_panels();
@@ -963,6 +1051,63 @@ impl App {
         self.prev_view_h.set(prev);
     }
 
+    /// Mouse-driven layout overrides (divider drags).
+    pub(crate) fn layout_overrides(&self) -> LayoutOverrides {
+        self.layout_overrides
+    }
+
+    /// Recorded by the main renderer each frame for mouse hit-testing.
+    pub(crate) fn set_last_layout(&self, layout: ScreenLayout) {
+        self.last_layout.set(Some(layout));
+    }
+
+    /// Recorded by the fullscreen renderer each frame.
+    pub(crate) fn set_last_full_rect(&self, rect: ratatui::layout::Rect, btn_y: u16) {
+        self.last_full_rect.set(Some(rect));
+        self.last_full_btn_y.set(btn_y);
+    }
+
+    /// Replace a click hit map (recorded while rendering).
+    pub(crate) fn set_hit(&self, which: HitMap, rows: Vec<(u16, usize)>) {
+        match which {
+            HitMap::Full => *self.full_hit.borrow_mut() = rows,
+            HitMap::Preview => *self.prev_hit.borrow_mut() = rows,
+            HitMap::Finder => *self.finder_hit.borrow_mut() = rows,
+            HitMap::Browser => *self.browser_hit.borrow_mut() = rows,
+        }
+    }
+
+    fn hit(&self, which: HitMap, y: u16) -> Option<usize> {
+        self.hit_map(which)
+            .iter()
+            .find(|(row_y, _)| *row_y == y)
+            .map(|(_, i)| *i)
+    }
+
+    fn hit_map(&self, which: HitMap) -> std::cell::Ref<'_, Vec<(u16, usize)>> {
+        match which {
+            HitMap::Full => self.full_hit.borrow(),
+            HitMap::Preview => self.prev_hit.borrow(),
+            HitMap::Finder => self.finder_hit.borrow(),
+            HitMap::Browser => self.browser_hit.borrow(),
+        }
+    }
+
+    /// Highlight a browser list row (project browser mouse support).
+    pub(crate) fn set_browser_selected(&mut self, index: usize) {
+        if let Some(b) = self.open_browser.as_mut() {
+            b.selected = index.min(b.row_count().saturating_sub(1));
+        }
+    }
+
+    pub(crate) fn browser_selected_index(&self) -> usize {
+        self.open_browser.as_ref().map(|b| b.selected).unwrap_or(0)
+    }
+
+    pub(crate) fn browser_hit_at(&self, row: u16) -> Option<usize> {
+        self.hit(HitMap::Browser, row)
+    }
+
     pub fn diff_scroll(&self) -> u16 {
         self.diff_scroll
     }
@@ -1074,6 +1219,141 @@ impl App {
         }
     }
 
+    /// Option list backing form row `i`: the known providers for row 0, the
+    /// models the provider reported for row 1, and nothing (free text) for
+    /// the key/base-URL rows. Row 1 is empty until a fetch lands, so the
+    /// row starts as an ordinary text field.
+    pub fn llm_row_options(&self, i: usize) -> Vec<&str> {
+        match i {
+            0 => git_tui_core::llm::PROVIDERS.to_vec(),
+            1 => self.llm_models.iter().map(String::as_str).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether a model-list fetch is in flight (the row shows "loading…").
+    pub fn llm_models_loading(&self) -> bool {
+        self.llm_models_loading
+    }
+
+    /// Why the last model fetch failed, if it did.
+    pub fn llm_models_error(&self) -> Option<&str> {
+        self.llm_models_error.as_deref()
+    }
+
+    /// Provider config as the form currently stands, used for the model
+    /// fetch (and nothing else: saving still goes through
+    /// [`Self::save_llm_settings`]).
+    fn llm_form_config(&self) -> LlmConfig {
+        LlmConfig {
+            provider: self.llm_field_value(0).trim().to_lowercase(),
+            model: String::new(),
+            api_key: self.llm_field_value(2).trim().to_string(),
+            base_url: {
+                let u = self.llm_field_value(3).trim().to_string();
+                if u.is_empty() {
+                    None
+                } else {
+                    Some(u)
+                }
+            },
+        }
+    }
+
+    /// Ask the provider which models it offers, unless that exact request
+    /// is already in flight or already answered. Called on every edit to
+    /// the provider/key/base-URL rows, so switching provider or pasting a
+    /// key refreshes the model row without an extra keypress.
+    fn refresh_llm_models(&mut self) {
+        let cfg = self.llm_form_config();
+        let target = llm_fetch_target(&cfg);
+        if target == self.llm_models_target {
+            return;
+        }
+        self.llm_models_target = target;
+        self.llm_models_request += 1;
+        self.llm_models.clear();
+        self.llm_models_error = None;
+        // An unknown provider or a `custom` one without a base URL has no
+        // list to ask for; the row stays free text.
+        if !git_tui_core::llm::PROVIDERS.contains(&cfg.provider.as_str())
+            || cfg.effective_base_url().is_empty()
+        {
+            self.llm_models_loading = false;
+            return;
+        }
+        // Listing models needs the same key as calling them (except for
+        // local ollama). Say so instead of firing a request that can only
+        // come back 401.
+        if !cfg.is_configured() {
+            self.llm_models_loading = false;
+            self.llm_models_error =
+                Some("add an API key below to list the provider's models".into());
+            return;
+        }
+        self.llm_models_loading = true;
+        let id = self.llm_models_request;
+        if let Err(e) = self.queue.submit(AsyncJob::FetchModels { id, llm: cfg }) {
+            self.llm_models_loading = false;
+            self.error = Some(e.to_string());
+        }
+    }
+
+    /// Fill the model row with a fetched list: keep the typed model when
+    /// the provider still offers it, else adopt the first one.
+    fn apply_llm_models(&mut self, models: Vec<String>) {
+        self.llm_models_loading = false;
+        self.llm_models_error = None;
+        self.llm_models = models;
+        let Some(first) = self.llm_models.first().cloned() else {
+            return;
+        };
+        let current = self.llm_form[1].trim().to_string();
+        if !current.is_empty() && self.llm_models.contains(&current) {
+            return;
+        }
+        self.llm_form[1] = first;
+        self.llm_cursors[1] = self.llm_form[1].chars().count();
+        if self.llm_selected() == 1 {
+            self.draft = self.llm_form[1].clone();
+            self.draft_cursor = self.llm_cursors[1];
+        }
+    }
+
+    /// `←/→` on a picker row: move to the neighbouring option (wrapping).
+    /// A typed value outside the list starts from its near end.
+    fn cycle_llm_option(&mut self, delta: isize) {
+        let options = self.llm_row_options(self.llm_selected());
+        if options.is_empty() {
+            return;
+        }
+        let current = self.draft.trim().to_lowercase();
+        let n = options.len() as isize;
+        let next = match options.iter().position(|o| *o == current) {
+            Some(i) => (i as isize + delta).rem_euclid(n) as usize,
+            None if delta < 0 => options.len() - 1,
+            None => 0,
+        };
+        self.draft = options[next].to_string();
+        self.move_draft_end();
+        if self.llm_selected() == 0 {
+            self.refresh_llm_models();
+        }
+    }
+
+    /// `←/→`: cycle options on the provider/model rows, move the text
+    /// cursor on the free-text rows.
+    fn on_llm_arrow(&mut self, delta: isize) {
+        let row = self.llm_selected();
+        if LLM_PICKER_ROWS.contains(&row) && !self.llm_row_options(row).is_empty() {
+            self.cycle_llm_option(delta);
+        } else if delta < 0 {
+            self.move_draft_left();
+        } else {
+            self.move_draft_right();
+        }
+    }
+
     /// `A` in the file list: open the LLM setup form prefilled from the
     /// current `[llm]` config (or its defaults).
     pub fn begin_llm_settings(&mut self) {
@@ -1091,6 +1371,12 @@ impl App {
         self.draft = self.llm_form[0].clone();
         self.move_draft_end();
         self.llm_cursors[0] = self.draft_cursor();
+        // Re-ask for the current provider's models: the row must never
+        // show a list left over from the previous form.
+        self.llm_models.clear();
+        self.llm_models_error = None;
+        self.llm_models_target.clear();
+        self.refresh_llm_models();
     }
 
     /// Stash the live draft/cursor into the selected form row.
@@ -1131,13 +1417,14 @@ impl App {
             return;
         }
         let model = self.llm_form[1].trim().to_string();
+        if model.is_empty() {
+            self.error =
+                Some("no model set: pick one from the provider list or type a model id".into());
+            return;
+        }
         self.llm = LlmConfig {
             provider,
-            model: if model.is_empty() {
-                LlmConfig::default().model
-            } else {
-                model
-            },
+            model,
             api_key: self.llm_form[2].trim().to_string(),
             base_url: {
                 let u = self.llm_form[3].trim().to_string();
@@ -1164,14 +1451,15 @@ impl App {
     }
 
     /// Keys inside the LLM setup form. Tab/Up/Down switch rows; the draft
-    /// line edits the selected row; Enter saves; Esc cancels.
+    /// line edits the selected row, except `←/→` on the provider/model rows
+    /// which steps through their options instead. Enter saves; Esc cancels.
     fn on_key_llm_settings(&mut self, key: KeyCode) {
         match key {
             KeyCode::Char(c) => self.insert_draft_char(c),
             KeyCode::Backspace => self.delete_draft_before(),
             KeyCode::Delete => self.delete_draft_after(),
-            KeyCode::Left => self.move_draft_left(),
-            KeyCode::Right => self.move_draft_right(),
+            KeyCode::Left => self.on_llm_arrow(-1),
+            KeyCode::Right => self.on_llm_arrow(1),
             KeyCode::Home => self.move_draft_home(),
             KeyCode::End => self.move_draft_end(),
             KeyCode::Up => self.move_llm_selection(-1),
@@ -1180,6 +1468,11 @@ impl App {
             KeyCode::Enter => self.save_llm_settings(),
             KeyCode::Esc => self.cancel_llm_settings(),
             _ => {}
+        }
+        // Provider, API key, and base URL decide which models are on
+        // offer, so any edit to those rows re-asks the provider.
+        if matches!(self.llm_selected(), 0 | 2 | 3) {
+            self.refresh_llm_models();
         }
     }
 
@@ -1452,6 +1745,23 @@ impl App {
             self.begin_visual(VisualMode::Linewise);
         } else if key == KeyCode::Char('y') && self.focus == Focus::Diff {
             self.begin_yank();
+        } else if key == KeyCode::Char('J') && self.focus == Focus::Diff {
+            // Hunk jump in the preview too: the cursor snaps to the next
+            // hunk top (same as fullscreen `J`).
+            if !self.show_markdown_preview() {
+                self.select_hunk(self.hunk.saturating_add(1));
+            }
+        } else if key == KeyCode::Char('K') && self.focus == Focus::Diff {
+            // Hunk jump in the preview too: the cursor snaps to the
+            // previous hunk top (same as fullscreen `K`).
+            if !self.show_markdown_preview() {
+                self.select_hunk(self.hunk.saturating_sub(1));
+            }
+        } else if (key == KeyCode::Char('x') || key == KeyCode::Char('X'))
+            && self.focus == Focus::Diff
+        {
+            // Restore the hunk under the cursor (revert just that hunk).
+            self.discard_selected_hunk();
         } else if k.checkout.contains(&key) && self.focus == Focus::Branches {
             self.checkout_selected_branch();
         } else if k.stash_pop.contains(&key) && self.focus == Focus::Stash {
@@ -1513,9 +1823,11 @@ impl App {
 
     /// Keys inside the fullscreen diff overlay. `j/k`/`↑`/`↓` move the
     /// line cursor, `h/l`/`←`/`→` move the nvim-style block column,
-    /// `0`/`Home`/`End` jump it, `J`/`K` jump by hunk, `v`/`V` select,
-    /// `y` yanks, `/` finds another file without leaving fullscreen;
-    /// Esc leaves visual mode first, then closes back to the file list.
+    /// `0`/`Home`/`End` jump it, `J`/`K` jump by hunk (the cursor snaps to
+    /// the hunk top), `v`/`V` select, `y` yanks, `x` restores the hunk
+    /// under the cursor, `/` finds another file without leaving
+    /// fullscreen; Esc leaves visual mode first, then closes back to the
+    /// file list.
     fn on_key_full_diff(&mut self, key: KeyCode) {
         let k = self.keys.clone();
         if key == KeyCode::Esc {
@@ -1553,6 +1865,8 @@ impl App {
             self.begin_yank();
         } else if k.stage.contains(&key) {
             self.stage_selected_hunk();
+        } else if key == KeyCode::Char('x') || key == KeyCode::Char('X') {
+            self.discard_selected_hunk();
         } else if k.discard.contains(&key) {
             self.discard_loaded_file();
         } else if k.scroll_up.contains(&key) {
@@ -1829,6 +2143,400 @@ impl App {
         self.cursor = self.cursor.min(self.diff_rows.len().saturating_sub(1));
         // Snap the selected hunk to the top of the view.
         self.diff_scroll = self.hunk_start_row(clamped);
+    }
+
+    /// Point the line cursor at `row` without moving the viewport (mouse
+    /// clicks land on a visible row; snapping would yank it to the top).
+    fn point_cursor_at(&mut self, row: usize) {
+        if self.diff_rows.is_empty() || self.show_markdown_preview() {
+            return;
+        }
+        self.cursor = row.min(self.diff_rows.len().saturating_sub(1));
+        self.cursor_col = 0;
+        self.sync_hunk_to_cursor();
+        self.ensure_cursor_visible();
+    }
+
+    /// Jump to hunk `index` like [`Self::select_hunk`] but keep the
+    /// viewport stable (mouse clicks on a hunk header).
+    fn point_hunk_at(&mut self, index: usize) {
+        let clamped = index.min(self.hunk_count().saturating_sub(1));
+        self.hunk = clamped;
+        self.cursor =
+            (self.hunk_start_row(clamped) as usize).min(self.diff_rows.len().saturating_sub(1));
+        self.cursor_col = 0;
+        self.ensure_cursor_visible();
+    }
+
+    /// Left-press at screen cell `(col, row)`: start a divider drag, or
+    /// click a panel / footer button. No-op while a text modal owns the
+    /// keyboard (commit, branch, stash, LLM, push/pull prompts).
+    pub fn on_mouse_down(&mut self, col: u16, row: u16) {
+        match self.mode {
+            Mode::FindFile => {
+                self.click_finder(row);
+                return;
+            }
+            Mode::Normal | Mode::FullDiff => {}
+            _ => return,
+        }
+        if self.mode == Mode::FullDiff {
+            self.click_full(col, row);
+            return;
+        }
+        let Some(layout) = self.last_layout.get() else {
+            return;
+        };
+        let footer = layout.footer;
+        if row == footer.y && mouse_in(col, row, footer) {
+            let buttons = footer_buttons(self);
+            if let Some(action) =
+                footer_button_at(&buttons, (col.saturating_sub(footer.x)) as usize)
+            {
+                self.error = None;
+                self.notice = None;
+                self.click_footer_button(action);
+            }
+            return;
+        }
+        if mouse_in(col, row, footer) {
+            return;
+        }
+        // Divider drags win over panel clicks (1-cell grip tolerance).
+        let dx = rail_divider_x(&layout);
+        if row < footer.y && (col == dx || col.saturating_add(1) == dx) {
+            self.drag = Some(DragTarget::RailV);
+            self.on_mouse_drag(col, row);
+            return;
+        }
+        for (i, dy) in panel_divider_ys(&layout).iter().enumerate() {
+            if row == *dy && col < dx {
+                self.drag = Some(DragTarget::Panel(i));
+                self.on_mouse_drag(col, row);
+                return;
+            }
+        }
+        self.click_normal(col, row, &layout);
+    }
+
+    /// Left-drag at `(col, row)`: resize while a divider drag is active.
+    /// Dividers only exist in the normal layout, so a drag that outlives
+    /// a mode switch is dropped.
+    pub fn on_mouse_drag(&mut self, col: u16, row: u16) {
+        if self.mode != Mode::Normal {
+            self.drag = None;
+            return;
+        }
+        let Some(target) = self.drag else {
+            return;
+        };
+        let Some(layout) = self.last_layout.get() else {
+            return;
+        };
+        match target {
+            DragTarget::RailV => {
+                let origin_x = layout.status.x;
+                let full_w = layout
+                    .diff
+                    .x
+                    .saturating_add(layout.diff.width)
+                    .saturating_sub(origin_x);
+                let low = crate::ui::MIN_RAIL_W.min(full_w);
+                let high = full_w
+                    .saturating_sub(20)
+                    .max(low)
+                    .min(crate::ui::MAX_RAIL_W.max(low));
+                let want = col.saturating_sub(origin_x).clamp(low, high.max(low));
+                self.layout_overrides.rail_w = Some(want);
+            }
+            DragTarget::Panel(i) => {
+                let rect = [layout.status, layout.files, layout.branches, layout.commits][i];
+                let want = row
+                    .saturating_sub(rect.y)
+                    .saturating_add(1)
+                    .max(crate::ui::MIN_PANEL_H);
+                self.layout_overrides.heights[i] = Some(want);
+            }
+        }
+    }
+
+    /// Left-release: end any divider drag.
+    pub fn on_mouse_up(&mut self) {
+        self.drag = None;
+    }
+
+    /// Scroll wheel at `(col, row)`: `up == true` is wheel-up.
+    pub fn on_wheel(&mut self, col: u16, row: u16, up: bool) {
+        if !matches!(self.mode, Mode::Normal | Mode::FullDiff) {
+            return;
+        }
+        let delta: isize = if up { -3 } else { 3 };
+        if self.mode == Mode::FullDiff {
+            self.move_cursor_or_scroll(delta);
+            return;
+        }
+        let Some(layout) = self.last_layout.get() else {
+            return;
+        };
+        if mouse_in(col, row, layout.files) {
+            self.focus = Focus::Status;
+            if up {
+                self.step_tree(false);
+            } else {
+                self.step_tree(true);
+            }
+        } else if mouse_in(col, row, layout.branches) {
+            self.focus = Focus::Branches;
+            let n = self.branch_count();
+            if n > 0 {
+                if up {
+                    self.branch_selected = self.branch_selected.saturating_sub(3);
+                } else {
+                    self.branch_selected = (self.branch_selected + 3).min(n - 1);
+                }
+            }
+        } else if mouse_in(col, row, layout.commits) {
+            self.focus = Focus::Log;
+            self.scroll_log_by(delta);
+        } else if mouse_in(col, row, layout.stash) {
+            self.focus = Focus::Stash;
+            let n = self.stash_count();
+            if n > 0 {
+                if up {
+                    self.stash_selected = self.stash_selected.saturating_sub(3);
+                } else {
+                    self.stash_selected = (self.stash_selected + 3).min(n - 1);
+                }
+            }
+        } else if mouse_in(col, row, layout.diff) {
+            self.focus = Focus::Diff;
+            self.move_cursor_or_scroll(delta);
+        } else if mouse_in(col, row, layout.status) {
+            self.focus = Focus::Status;
+        }
+    }
+
+    /// Click inside the normal (non-fullscreen) layout.
+    fn click_normal(&mut self, col: u16, row: u16, layout: &ScreenLayout) {
+        self.error = None;
+        self.notice = None;
+        if mouse_in(col, row, layout.status) {
+            self.focus = Focus::Status;
+        } else if mouse_in(col, row, layout.files) {
+            self.focus = Focus::Status;
+            self.click_file_row(layout, row);
+        } else if mouse_in(col, row, layout.branches) {
+            self.focus = Focus::Branches;
+            let scroll = self.branch_scroll.get();
+            let count = self.branch_count();
+            self.click_list_row(row, layout.branches, scroll, count, |app, i| {
+                app.branch_selected = i;
+            });
+        } else if mouse_in(col, row, layout.commits) {
+            self.focus = Focus::Log;
+        } else if mouse_in(col, row, layout.stash) {
+            self.focus = Focus::Stash;
+            let scroll = self.stash_scroll.get();
+            let count = self.stash_count();
+            self.click_list_row(row, layout.stash, scroll, count, |app, i| {
+                app.stash_selected = i;
+            });
+        } else if mouse_in(col, row, layout.diff) {
+            self.focus = Focus::Diff;
+            if let Some(idx) = self.hit(HitMap::Preview, row) {
+                self.point_cursor_at(idx);
+            }
+        }
+    }
+
+    /// Click a 1-per-line list panel (branches, stash): map the screen
+    /// row to an item index and select it.
+    fn click_list_row(
+        &mut self,
+        row: u16,
+        rect: ratatui::layout::Rect,
+        scroll: usize,
+        count: usize,
+        select: impl FnOnce(&mut Self, usize),
+    ) {
+        if count == 0 {
+            return;
+        }
+        let visible = rect.height.saturating_sub(2) as usize;
+        let inner = row.saturating_sub(rect.y.saturating_add(1)) as usize;
+        if inner >= visible {
+            return;
+        }
+        let idx = inner.saturating_add(scroll).min(count - 1);
+        select(self, idx);
+    }
+
+    /// Click a files-tree row: focus the file list and select the row. A
+    /// click on the already-selected file opens it fullscreen (mouse
+    /// double-click without a timer).
+    fn click_file_row(&mut self, layout: &ScreenLayout, row: u16) {
+        let rect = layout.files;
+        let visible = rect.height.saturating_sub(2) as usize;
+        let inner = row.saturating_sub(rect.y.saturating_add(1)) as usize;
+        if inner >= visible {
+            return;
+        }
+        let rows = visible_file_rows(&self.file_list, |d| self.collapsed.contains(d));
+        let pos = inner.saturating_add(self.files_scroll.get());
+        let Some(target) = rows.get(pos).cloned() else {
+            return;
+        };
+        match target {
+            FileRow::File { index, .. } => {
+                if Some(index) == Some(self.selected) && self.dir_cursor.is_none() {
+                    self.open_full_diff();
+                } else {
+                    self.selected = index;
+                    self.dir_cursor = None;
+                    self.maybe_load_diff();
+                }
+            }
+            FileRow::Dir { path, .. } => {
+                let dir = path.to_string();
+                if self.cursor_dir().is_some_and(|d| d == dir) {
+                    // Second click on an open header previews its first
+                    // file fullscreen instead.
+                    self.open_full_diff();
+                } else if self.collapsed.contains(&dir) {
+                    if let Some(anchor) = self.folder_anchor(&dir, true) {
+                        self.selected = anchor;
+                    }
+                    self.dir_cursor = None;
+                    self.maybe_load_diff();
+                } else {
+                    let prefix = format!("{dir}/");
+                    if let Some(first) = self
+                        .file_list
+                        .iter()
+                        .position(|f| f.path.starts_with(&prefix))
+                    {
+                        self.selected = first;
+                    }
+                    self.dir_cursor = Some(dir);
+                    self.maybe_load_diff();
+                }
+            }
+        }
+    }
+
+    /// Click inside the fullscreen diff: move the cursor to the clicked
+    /// row (a header click jumps to that hunk without snapping the view),
+    /// or fire the button bar.
+    fn click_full(&mut self, col: u16, row: u16) {
+        self.error = None;
+        self.notice = None;
+        if let Some(rect) = self.last_full_rect.get() {
+            let btn_y = self.last_full_btn_y.get();
+            if row == btn_y
+                && col >= rect.x.saturating_add(1)
+                && col < rect.x.saturating_add(rect.width.saturating_sub(1))
+            {
+                let buttons = footer_buttons(self);
+                if let Some(action) = footer_button_at(
+                    &buttons,
+                    (col.saturating_sub(rect.x.saturating_add(1))) as usize,
+                ) {
+                    self.click_footer_button(action);
+                }
+                return;
+            }
+        }
+        let Some(idx) = self.hit(HitMap::Full, row) else {
+            return;
+        };
+        if let Some(crate::ui::DiffRow::Header { index }) = self.diff_rows.get(idx) {
+            let index = *index;
+            self.point_hunk_at(index);
+        } else {
+            self.point_cursor_at(idx);
+        }
+    }
+
+    /// Click a finder match row: select it, or open it when it is already
+    /// selected (mouse double-click without a timer).
+    fn click_finder(&mut self, row: u16) {
+        let Some(pos) = self.hit(HitMap::Finder, row) else {
+            return;
+        };
+        if pos == self.finder_cursor() {
+            self.expand_selected();
+            self.submit_finder();
+        } else {
+            self.finder_selected = pos.min(self.finder_matches().len().saturating_sub(1));
+        }
+    }
+
+    /// Fire a footer button (mouse) with the same semantics as its key.
+    pub(crate) fn click_footer_button(&mut self, action: FooterAction) {
+        match action {
+            FooterAction::Stage => {
+                if self.focus == Focus::Status {
+                    self.toggle_stage();
+                }
+            }
+            FooterAction::Discard => {
+                if self.mode == Mode::FullDiff {
+                    self.discard_loaded_file();
+                } else if self.focus == Focus::Status {
+                    self.discard_selected();
+                }
+            }
+            FooterAction::Commit => {
+                if self.mode == Mode::Normal {
+                    self.mode = Mode::Committing;
+                    self.draft.clear();
+                }
+            }
+            FooterAction::Pull => self.start_pull(),
+            FooterAction::Push => self.start_push(),
+            FooterAction::Find => self.open_finder(),
+            FooterAction::OpenDiff => self.open_full_diff(),
+            FooterAction::CloseDiff => {
+                if self.mode == Mode::FullDiff {
+                    self.mode = Mode::Normal;
+                    self.snap_scroll_to_cursor();
+                }
+            }
+            FooterAction::StageHunk => self.stage_selected_hunk(),
+            FooterAction::RestoreHunk => self.discard_selected_hunk(),
+            FooterAction::Checkout => {
+                if self.focus == Focus::Branches {
+                    self.checkout_selected_branch();
+                }
+            }
+            FooterAction::NewBranch => {
+                if self.focus == Focus::Branches {
+                    self.mode = Mode::NewBranch;
+                    self.draft.clear();
+                }
+            }
+            FooterAction::DeleteBranch => {
+                if self.focus == Focus::Branches {
+                    self.delete_selected_branch();
+                }
+            }
+            FooterAction::StashPop => {
+                if self.focus == Focus::Stash {
+                    self.pop_selected_stash();
+                }
+            }
+            FooterAction::StashPush => {
+                if self.focus == Focus::Stash {
+                    self.mode = Mode::StashPush;
+                    self.draft.clear();
+                }
+            }
+            FooterAction::StashDrop => {
+                if self.focus == Focus::Stash {
+                    self.drop_selected_stash();
+                }
+            }
+        }
     }
 
     /// Move the line cursor by `delta` rows, clamped to the loaded rows.
@@ -2318,6 +3026,50 @@ impl App {
         if let Some(file) = self.file_list.iter().find(|f| f.path == path).cloned() {
             self.discard_file_entry(&file);
         } else if let Err(e) = self.queue.submit(AsyncJob::DiscardFile { path }) {
+            self.error = Some(e.to_string());
+        }
+    }
+
+    /// `x` in the diff (preview or fullscreen): restore the hunk under
+    /// the cursor, reverting just that hunk's region while leaving every
+    /// other hunk untouched. Unstaged hunks revert the workdir toward the
+    /// index; staged hunks revert the index toward HEAD.
+    fn discard_selected_hunk(&mut self) {
+        if self.show_markdown_preview() {
+            return;
+        }
+        let Some((path, staged)) = self.diff_for.clone() else {
+            self.error = Some("no diff loaded".into());
+            return;
+        };
+        if self.diff_whole_file {
+            self.error = Some("nothing to restore: file has no hunks".into());
+            return;
+        }
+        let Some(diff) = self.diff.as_ref() else {
+            self.error = Some("no diff loaded".into());
+            return;
+        };
+        if diff.binary {
+            self.error = Some("cannot restore hunk of binary file".into());
+            return;
+        }
+        let has_changes = diff.hunks.get(self.hunk).is_some_and(|h| {
+            h.lines.iter().any(|l| {
+                l.kind == git_tui_core::diff::LineKind::Add
+                    || l.kind == git_tui_core::diff::LineKind::Del
+            })
+        });
+        if !has_changes {
+            self.error = Some("nothing to restore in this hunk".into());
+            return;
+        }
+        let job = AsyncJob::DiscardHunk {
+            path,
+            hunk_index: self.hunk,
+            staged,
+        };
+        if let Err(e) = self.queue.submit(job) {
             self.error = Some(e.to_string());
         }
     }
@@ -2862,6 +3614,20 @@ impl App {
             AsyncResult::SyncStatus(st) => {
                 self.sync = Some(st);
             }
+            AsyncResult::Models { id, models } => {
+                // Only the newest request may write the row: an earlier
+                // one can still land after the form moved on.
+                if id == self.llm_models_request {
+                    self.apply_llm_models(models);
+                }
+            }
+            AsyncResult::ModelsError { id, error } => {
+                if id == self.llm_models_request {
+                    self.llm_models_loading = false;
+                    self.llm_models.clear();
+                    self.llm_models_error = Some(error);
+                }
+            }
             AsyncResult::GeneratedMessage(msg) => {
                 self.generating = false;
                 // The user may have Esc'd while the network call was in
@@ -2909,6 +3675,18 @@ impl App {
             }
         }
     }
+}
+
+/// Identity of a model-fetch request: provider plus the base URL and key
+/// that change which list comes back. The key itself is never included in
+/// the string beyond a yes/no, so nothing secret reaches logs or tests.
+fn llm_fetch_target(cfg: &LlmConfig) -> String {
+    format!(
+        "{}|{}|{}",
+        cfg.provider,
+        cfg.base_url.clone().unwrap_or_default(),
+        !cfg.effective_api_key().is_empty()
+    )
 }
 
 /// Push `text` to the system clipboard with an OSC 52 escape. Terminal-
@@ -3758,6 +4536,162 @@ mod tests {
         fx.app.on_key(KeyCode::Char('J'));
         assert_eq!(fx.app.hunk(), 1);
         assert!(fx.app.diff_scroll() > 1);
+    }
+
+    #[test]
+    fn preview_jk_jump_by_hunk_and_cursor_follows() {
+        let mut fx = two_hunk_fixture();
+        // Focus the right-side preview without going fullscreen.
+        fx.app.on_key(KeyCode::Char('5'));
+        assert_eq!(fx.app.focus(), Focus::Diff);
+        assert_eq!(fx.app.hunk(), 0);
+        let first_cursor = fx.app.cursor_row();
+        fx.app.on_key(KeyCode::Char('J'));
+        assert_eq!(fx.app.hunk(), 1, "preview J must jump to next hunk");
+        assert!(
+            fx.app.cursor_row() > first_cursor,
+            "cursor must jump with the hunk"
+        );
+        fx.app.on_key(KeyCode::Char('K'));
+        assert_eq!(fx.app.hunk(), 0, "preview K must jump back");
+    }
+
+    /// Fabricated screen geometry for mouse tests (matches a 100x32
+    /// terminal with the two-line footer).
+    fn mouse_layout(app: &mut App) -> crate::ui::ScreenLayout {
+        let layout = crate::ui::compute_layout(
+            ratatui::layout::Rect::new(0, 0, 100, 32),
+            2,
+            app.layout_overrides(),
+        );
+        app.set_last_layout(layout);
+        layout
+    }
+
+    /// Zero-based cell offset of the footer button labeled `want`.
+    fn button_x(app: &App, want: &str) -> u16 {
+        let mut off = 0usize;
+        for (label, _) in crate::ui::footer_buttons(app) {
+            if label == want {
+                return off as u16;
+            }
+            off += label.len() + 3;
+        }
+        panic!("no footer button {want:?}");
+    }
+
+    #[test]
+    fn rail_divider_drag_resizes_preview() {
+        let mut fx = harness(&["a.txt"]);
+        let layout = mouse_layout(&mut fx.app);
+        let dx = crate::ui::rail_divider_x(&layout);
+        assert_eq!(dx, 30);
+        let mid = layout.files.y + 2;
+        fx.app.on_mouse_down(dx, mid);
+        assert_eq!(fx.app.drag, Some(DragTarget::RailV));
+        fx.app.on_mouse_drag(dx + 10, mid);
+        fx.app.on_mouse_up();
+        assert_eq!(fx.app.drag, None);
+        let layout = mouse_layout(&mut fx.app);
+        assert_eq!(layout.diff.x, 40, "dragged divider must move the preview");
+    }
+
+    #[test]
+    fn panel_divider_drag_resizes_files() {
+        let mut fx = harness(&["a.txt"]);
+        let layout = mouse_layout(&mut fx.app);
+        let dys = crate::ui::panel_divider_ys(&layout);
+        let before = layout.files.height;
+        fx.app.on_mouse_down(2, dys[1]);
+        assert_eq!(fx.app.drag, Some(DragTarget::Panel(1)));
+        fx.app.on_mouse_drag(2, dys[1] + 2);
+        fx.app.on_mouse_up();
+        let layout = mouse_layout(&mut fx.app);
+        assert_eq!(layout.files.height, before + 2);
+    }
+
+    #[test]
+    fn footer_buttons_fire_like_keys() {
+        let mut fx = harness(&["a.txt"]);
+        let layout = mouse_layout(&mut fx.app);
+        let y = layout.footer.y;
+        fx.app.on_mouse_down(button_x(&fx.app, "Find") + 1, y);
+        assert_eq!(fx.app.mode(), Mode::FindFile);
+        fx.app.on_key(KeyCode::Esc);
+        fx.app.on_mouse_down(button_x(&fx.app, "Commit") + 1, y);
+        assert_eq!(fx.app.mode(), Mode::Committing);
+    }
+
+    #[test]
+    fn file_click_selects_and_second_click_opens_fullscreen() {
+        let mut fx = harness(&["a.txt", "b.txt"]);
+        let layout = mouse_layout(&mut fx.app);
+        // Tree rows: a.txt on the first inner line, b.txt on the next.
+        let y0 = layout.files.y + 1;
+        fx.app.on_mouse_down(2, y0 + 1);
+        assert_eq!(fx.app.selected_file().unwrap().path, "b.txt");
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        // Clicking the already-selected file opens it fullscreen.
+        fx.app.on_mouse_down(2, y0 + 1);
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+    }
+
+    #[test]
+    fn wheel_over_files_steps_the_tree() {
+        let mut fx = harness(&["a.txt", "b.txt", "c.txt"]);
+        let layout = mouse_layout(&mut fx.app);
+        let (x, y) = (layout.files.x + 2, layout.files.y + 2);
+        fx.app.on_wheel(x, y, false);
+        assert_eq!(fx.app.selected(), 1);
+        fx.app.on_wheel(x, y, true);
+        assert_eq!(fx.app.selected(), 0);
+    }
+
+    #[test]
+    fn preview_click_moves_the_cursor() {
+        let mut fx = two_hunk_fixture();
+        let layout = mouse_layout(&mut fx.app);
+        let y = layout.diff.y + 2;
+        fx.app.set_hit(HitMap::Preview, vec![(y, 2)]);
+        fx.app.on_mouse_down(layout.diff.x + 4, y);
+        assert_eq!(fx.app.focus(), Focus::Diff);
+        assert_eq!(fx.app.cursor_row(), 2);
+    }
+
+    #[test]
+    fn fullscreen_click_moves_cursor_and_header_jumps_hunk() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+        let h1 = fx.app.hunk_start_row(1) as usize;
+        fx.app
+            .set_last_full_rect(ratatui::layout::Rect::new(0, 0, 100, 32), u16::MAX);
+        fx.app.set_hit(HitMap::Full, vec![(10, h1 + 1), (20, h1)]);
+        fx.app.on_mouse_down(5, 10);
+        assert_eq!(fx.app.cursor_row(), h1 + 1);
+        assert_eq!(fx.app.hunk(), 1);
+        // Header click jumps to that hunk (the viewport only follows
+        // enough to keep the cursor visible, no top snap).
+        fx.app.on_mouse_down(5, 20);
+        assert_eq!(fx.app.hunk(), 1);
+        assert_eq!(fx.app.cursor_row(), h1);
+        assert_eq!(fx.app.diff_scroll(), h1 as u16);
+    }
+
+    #[test]
+    fn fullscreen_button_bar_fires_stage_and_close() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        let rect = ratatui::layout::Rect::new(0, 0, 100, 32);
+        fx.app.set_last_full_rect(rect, 30);
+        // First button is `[Stage hunk]`: fires the staging job path
+        // (fails silently here without assertion — mode must not change).
+        fx.app.on_mouse_down(rect.x + 2, 30);
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+        // `[Close]` leaves fullscreen.
+        let x = button_x(&fx.app, "Close");
+        fx.app.on_mouse_down(rect.x + 1 + x, 30);
+        assert_eq!(fx.app.mode(), Mode::Normal);
     }
 
     /// Repo with `a.txt` dirtied and `b.txt` left clean.
@@ -5368,6 +6302,153 @@ mod tests {
         assert_eq!(fx.app.mode(), Mode::LlmSettings, "bad input stays open");
         assert!(fx.app.error().unwrap_or("").contains("unknown provider"));
         assert_eq!(fx.app.llm.provider, "openai", "bad input not applied");
+    }
+
+    #[test]
+    fn llm_settings_arrows_cycle_provider_and_follow_with_model() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('A'));
+        // openai → openrouter on the first press, wrapping at the list end.
+        assert_eq!(fx.app.llm_field_value(0), "openai");
+        fx.app.on_key(KeyCode::Left);
+        assert_eq!(fx.app.llm_field_value(0), "custom", "← wraps to the end");
+        fx.app.on_key(KeyCode::Right);
+        assert_eq!(fx.app.llm_field_value(0), "openai", "→ wraps to the start");
+        fx.app.on_key(KeyCode::Right);
+        assert_eq!(fx.app.llm_field_value(0), "openrouter");
+        // Models come from the provider, not a compiled-in list: with
+        // none fetched the row is plain text and shows why.
+        fx.app.on_key(KeyCode::Tab);
+        assert_eq!(fx.app.llm_selected(), 1);
+        assert!(fx.app.llm_row_options(1).is_empty(), "nothing fetched yet");
+        assert!(
+            fx.app.llm_models_error().unwrap_or("").contains("API key"),
+            "no key means no listing: {:?}",
+            fx.app.llm_models_error()
+        );
+        // Save applies the pair as typed.
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        assert_eq!(fx.app.llm.provider, "openrouter");
+        assert_eq!(fx.app.llm.model, "gpt-4o-mini", "model kept as prefilled");
+    }
+
+    #[test]
+    fn fetched_models_fill_and_cycle_the_model_row() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('A'));
+        // Pretend the provider answered with its real list.
+        let id = fx.app.llm_models_request;
+        fx.app.apply(git_tui_core::jobqueue::AsyncResult::Models {
+            id,
+            models: vec![
+                "anthropic/claude-3.5-haiku".into(),
+                "openai/gpt-4o-mini".into(),
+            ],
+        });
+        assert!(!fx.app.llm_models_loading());
+        assert!(fx.app.llm_models_error().is_none());
+        // The row takes the first id the provider reported.
+        fx.app.on_key(KeyCode::Tab);
+        assert_eq!(fx.app.llm_selected(), 1);
+        assert_eq!(fx.app.llm_field_value(1), "anthropic/claude-3.5-haiku");
+        assert_eq!(fx.app.llm_row_options(1).len(), 2);
+        // `←/→` now cycle the fetched ids instead of editing text.
+        fx.app.on_key(KeyCode::Right);
+        assert_eq!(fx.app.llm_field_value(1), "openai/gpt-4o-mini");
+        fx.app.on_key(KeyCode::Right);
+        assert_eq!(fx.app.llm_field_value(1), "anthropic/claude-3.5-haiku");
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.llm.model, "anthropic/claude-3.5-haiku");
+    }
+
+    #[test]
+    fn stale_model_list_for_another_provider_is_dropped() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('A'));
+        let first = fx.app.llm_models_request;
+        // ...user switches provider before it lands.
+        fx.app.on_key(KeyCode::Right);
+        assert_eq!(fx.app.llm_field_value(0), "openrouter");
+        assert!(fx.app.llm_models_request > first, "a new request went out");
+        fx.app.apply(git_tui_core::jobqueue::AsyncResult::Models {
+            id: first,
+            models: vec!["gpt-4o-mini".into()],
+        });
+        assert!(
+            fx.app.llm_row_options(1).is_empty(),
+            "openai's list must not fill the row for openrouter"
+        );
+    }
+
+    #[test]
+    fn model_fetch_error_leaves_the_row_usable() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('A'));
+        let id = fx.app.llm_models_request;
+        fx.app
+            .apply(git_tui_core::jobqueue::AsyncResult::ModelsError {
+                id,
+                error: "provider HTTP 401: bad key".into(),
+            });
+        assert!(!fx.app.llm_models_loading());
+        assert!(fx.app.llm_models_error().unwrap().contains("401"));
+        // Typing still works and the form still saves.
+        fx.app.on_key(KeyCode::Tab);
+        fx.app.clear_draft();
+        for c in "gpt-4o".chars() {
+            fx.app.on_key(KeyCode::Char(c));
+        }
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        assert_eq!(fx.app.llm.model, "gpt-4o");
+    }
+
+    #[test]
+    fn saving_without_a_model_is_refused() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('A'));
+        fx.app.on_key(KeyCode::Tab);
+        for _ in 0..20 {
+            fx.app.on_key(KeyCode::Delete);
+        }
+        assert_eq!(fx.app.llm_field_value(1), "");
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::LlmSettings, "form stays open");
+        assert!(fx.app.error().unwrap().contains("no model"));
+    }
+
+    #[test]
+    fn llm_settings_custom_provider_keeps_typed_model() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('A'));
+        fx.app.clear_draft();
+        for c in "custom".chars() {
+            fx.app.on_key(KeyCode::Char(c));
+        }
+        // A typed value outside the list starts from its near end.
+        fx.app.on_key(KeyCode::Left);
+        assert_eq!(fx.app.llm_field_value(0), "gemini");
+        fx.app.clear_draft();
+        for c in "custom".chars() {
+            fx.app.on_key(KeyCode::Char(c));
+        }
+        // Nothing has been fetched for `custom`, so on the model row the
+        // arrows are plain text editing again.
+        fx.app.on_key(KeyCode::Tab);
+        assert!(fx.app.llm_row_options(1).is_empty());
+        fx.app.clear_draft();
+        for c in "my-local-model".chars() {
+            fx.app.on_key(KeyCode::Char(c));
+        }
+        for _ in 0..4 {
+            fx.app.on_key(KeyCode::Left);
+        }
+        fx.app.on_key(KeyCode::Char('X'));
+        assert_eq!(fx.app.llm_field_value(1), "my-local-mXodel");
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.llm.provider, "custom");
+        assert_eq!(fx.app.llm.model, "my-local-mXodel");
     }
 
     #[test]

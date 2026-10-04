@@ -147,6 +147,17 @@ impl Repo {
         crate::stage::stage_hunk(&self.inner, path, hunk_index)
     }
 
+    /// Restore a single hunk (`staged = false` reverts the workdir hunk,
+    /// `staged = true` reverts the index hunk toward HEAD).
+    pub fn discard_hunk(
+        &self,
+        path: &str,
+        hunk_index: usize,
+        staged: bool,
+    ) -> Result<(), GitError> {
+        crate::stage::discard_hunk(&self.inner, path, hunk_index, staged)
+    }
+
     pub fn commit(&self, message: &str) -> Result<git2::Oid, GitError> {
         crate::commit::commit(&self.inner, message)
     }

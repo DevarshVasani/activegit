@@ -236,20 +236,178 @@ fn write_index_content(repo: &git2::Repository, path: &str, data: &[u8]) -> Resu
 /// Parse `"@@ -old_start[,old_lines] +new_start[,new_lines] @@ ..."`
 /// into `(old_start, old_lines)`.
 fn parse_hunk_header(header: &str) -> Option<(usize, usize)> {
+    parse_hunk_header_full(header).map(|(old_start, old_lines, _, _)| (old_start, old_lines))
+}
+
+/// Full hunk header parse: `(old_start, old_lines, new_start, new_lines)`.
+/// A missing `,N` means 1 (git convention for single-line hunks).
+fn parse_hunk_header_full(header: &str) -> Option<(usize, usize, usize, usize)> {
     let header = header.trim();
     let inner = header.strip_prefix("@@")?.split("@@").next()?.trim();
     let mut parts = inner.split_whitespace();
     let old = parts.next()?.strip_prefix('-')?;
-    let (start_s, lines_s) = match old.split_once(',') {
-        Some((s, l)) => (s, Some(l)),
-        None => (old, None),
+    let new = parts.next()?.strip_prefix('+')?;
+    let parse_side = |s: &str| -> Option<(usize, usize)> {
+        match s.split_once(',') {
+            Some((start, lines)) => Some((start.parse().ok()?, lines.parse().ok()?)),
+            None => Some((s.parse().ok()?, 1)),
+        }
     };
-    let start: usize = start_s.parse().ok()?;
-    let lines: usize = match lines_s {
-        Some(l) => l.parse().ok()?,
-        None => 1,
+    let (old_start, old_lines) = parse_side(old)?;
+    let (new_start, new_lines) = parse_side(new)?;
+    Some((old_start, old_lines, new_start, new_lines))
+}
+
+/// Whether HEAD contains `path` (i.e. the file is tracked in HEAD).
+fn head_has_path(repo: &git2::Repository, path: &str) -> bool {
+    let rel = Path::new(path);
+    repo.head()
+        .ok()
+        .and_then(|h| h.peel_to_commit().ok())
+        .and_then(|c| c.tree().ok())
+        .and_then(|t| t.get_path(rel).ok())
+        .is_some()
+}
+
+/// Whether the index contains `path`.
+fn index_has_path(repo: &git2::Repository, path: &str) -> bool {
+    repo.index()
+        .ok()
+        .and_then(|idx| idx.get_path(Path::new(path), 0))
+        .is_some()
+}
+
+/// Restore (discard) a single hunk: revert that hunk's region to the
+/// "old" side while leaving every other hunk untouched.
+///
+/// - `staged = false`: the unstaged diff (index -> workdir). The workdir
+///   file's hunk region (`new` side) is replaced with the hunk's old
+///   segment (context + deletions). An untracked file whose only hunk is
+///   discarded is deleted, matching [`discard_file`].
+/// - `staged = true`: the staged diff (HEAD -> index). The index blob's
+///   hunk region is replaced with the HEAD side. A staged-new file whose
+///   only hunk is discarded is removed from the index (leaving the
+///   workdir file untracked).
+pub fn discard_hunk(
+    repo: &git2::Repository,
+    path: &str,
+    hunk_index: usize,
+    staged: bool,
+) -> Result<(), GitError> {
+    let fail = |msg: String| GitError::Discard(msg);
+    let diff = if staged {
+        crate::diff::staged_diff(repo, path)?
+    } else {
+        crate::diff::unstaged_diff(repo, path)?
     };
-    Some((start, lines))
+    if diff.binary {
+        return Err(fail(format!("cannot restore hunk of binary file {path}")));
+    }
+    if hunk_index >= diff.hunks.len() {
+        return Err(fail(format!(
+            "hunk index {hunk_index} out of range ({} hunks in {path})",
+            diff.hunks.len()
+        )));
+    }
+    let hunk = &diff.hunks[hunk_index];
+    let has_changes =
+        hunk.lines.iter().any(|l| {
+            l.kind == LineKind::Context || l.kind == LineKind::Add || l.kind == LineKind::Del
+        }) && hunk
+            .lines
+            .iter()
+            .any(|l| l.kind == LineKind::Add || l.kind == LineKind::Del);
+    if !has_changes {
+        return Err(fail(format!(
+            "nothing to restore in hunk {hunk_index} of {path}"
+        )));
+    }
+    let (_, _, new_start, new_lines) = parse_hunk_header_full(&hunk.header)
+        .ok_or_else(|| fail(format!("cannot parse hunk header: {}", hunk.header)))?;
+    // Old-side content for this hunk (what the region reverts to).
+    let old_segment: Vec<String> = hunk
+        .lines
+        .iter()
+        .filter(|l| l.kind == LineKind::Context || l.kind == LineKind::Del)
+        .map(|l| l.text.clone())
+        .collect();
+
+    if staged {
+        let base = index_blob_content(repo, path)?;
+        let base_ends_newline = base.ends_with('\n') || base.is_empty();
+        let mut base_lines: Vec<String> = if base.is_empty() {
+            Vec::new()
+        } else {
+            base.lines().map(|l| l.to_string()).collect()
+        };
+        let start = hunk_new_offset(new_start, new_lines, base_lines.len());
+        let end = (start + new_lines).min(base_lines.len());
+        base_lines.splice(start..end, old_segment);
+        if base_lines.is_empty() {
+            if !head_has_path(repo, path) {
+                // Staged-new file fully restored: drop it from the index so
+                // the workdir copy becomes untracked again.
+                let mut index = repo.index()?;
+                let _ = index.remove_path(Path::new(path));
+                index.write()?;
+                return Ok(());
+            }
+            write_index_content(repo, path, b"")?;
+            return Ok(());
+        }
+        let mut new_content = base_lines.join("\n");
+        if base_ends_newline {
+            new_content.push('\n');
+        }
+        write_index_content(repo, path, new_content.as_bytes())?;
+        return Ok(());
+    }
+
+    // Unstaged: rewrite the workdir file.
+    let full = repo
+        .workdir()
+        .ok_or_else(|| fail("bare repo".to_string()))?
+        .join(Path::new(path));
+    let bytes = std::fs::read(&full).map_err(|e| fail(format!("cannot read {path}: {e}")))?;
+    let base = String::from_utf8_lossy(&bytes);
+    let base_ends_newline = base.ends_with('\n') || base.is_empty();
+    let mut base_lines: Vec<String> = if base.is_empty() {
+        Vec::new()
+    } else {
+        base.lines().map(|l| l.to_string()).collect()
+    };
+    let start = hunk_new_offset(new_start, new_lines, base_lines.len());
+    let end = (start + new_lines).min(base_lines.len());
+    base_lines.splice(start..end, old_segment);
+    if base_lines.is_empty() {
+        if !head_has_path(repo, path) && !index_has_path(repo, path) {
+            // Untracked file fully restored: delete it like discard_file.
+            remove_workdir_path(repo, path).map_err(|e| fail(e.to_string()))?;
+            return Ok(());
+        }
+        std::fs::write(&full, b"").map_err(|e| fail(format!("cannot write {path}: {e}")))?;
+        return Ok(());
+    }
+    let mut new_content = base_lines.join("\n");
+    if base_ends_newline {
+        new_content.push('\n');
+    }
+    std::fs::write(&full, new_content.as_bytes())
+        .map_err(|e| fail(format!("cannot write {path}: {e}")))?;
+    Ok(())
+}
+
+/// 0-based workdir/index offset for a hunk's `new` side, clamped into the
+/// file. Mirrors the `old`-side offset math in [`stage_hunk`].
+fn hunk_new_offset(new_start: usize, new_lines: usize, file_len: usize) -> usize {
+    let start = if new_lines == 0 {
+        new_start
+    } else if new_start == 0 {
+        0
+    } else {
+        new_start.saturating_sub(1)
+    };
+    start.min(file_len)
 }
 
 #[cfg(test)]
@@ -379,6 +537,65 @@ mod tests {
         let err = discard_file(&repo, "a.txt").unwrap_err();
         match err {
             GitError::Discard(msg) => assert!(msg.contains("nothing to discard"), "got: {msg}"),
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discard_unstaged_hunk_leaves_other_hunks() {
+        let (_dir, repo) = two_hunk_repo();
+        let before = crate::diff::unstaged_diff(&repo, "a.txt").unwrap();
+        assert!(before.hunks.len() >= 2);
+        discard_hunk(&repo, "a.txt", 0, false).unwrap();
+        let after = crate::diff::unstaged_diff(&repo, "a.txt").unwrap();
+        assert_eq!(after.hunks.len(), before.hunks.len() - 1);
+        let content = fs::read_to_string(repo.workdir().unwrap().join("a.txt")).unwrap();
+        assert!(
+            content.contains("line 5\n"),
+            "first hunk restored: {content:?}"
+        );
+        assert!(
+            content.contains("line 35 CHANGED"),
+            "second hunk kept: {content:?}"
+        );
+    }
+
+    #[test]
+    fn discard_staged_hunk_reverts_index_only() {
+        let (_dir, repo) = two_hunk_repo();
+        stage_hunk(&repo, "a.txt", 0).unwrap();
+        assert_eq!(
+            crate::diff::staged_diff(&repo, "a.txt")
+                .unwrap()
+                .hunks
+                .len(),
+            1
+        );
+        discard_hunk(&repo, "a.txt", 0, true).unwrap();
+        assert!(crate::diff::staged_diff(&repo, "a.txt")
+            .unwrap()
+            .hunks
+            .is_empty());
+        // Workdir still holds both changes; only the index was restored.
+        let content = fs::read_to_string(repo.workdir().unwrap().join("a.txt")).unwrap();
+        assert!(content.contains("line 5 CHANGED"));
+    }
+
+    #[test]
+    fn discard_untracked_single_hunk_deletes_file() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        fs::write(repo.workdir().unwrap().join("new.txt"), "one\ntwo\n").unwrap();
+        discard_hunk(&repo, "new.txt", 0, false).unwrap();
+        assert!(!repo.workdir().unwrap().join("new.txt").exists());
+    }
+
+    #[test]
+    fn discard_out_of_range_hunk_errors() {
+        let (_dir, repo) = two_hunk_repo();
+        let err = discard_hunk(&repo, "a.txt", 99, false).unwrap_err();
+        match err {
+            GitError::Discard(msg) => assert!(msg.contains("out of range"), "got: {msg}"),
             other => panic!("wrong error: {other:?}"),
         }
     }
