@@ -42,19 +42,18 @@ impl Repo {
 
     /// Normalize raw user input into a path to discover from.
     /// Trims whitespace, rejects empty input, expands a leading `~` to
-    /// `$HOME`, and rejects paths that do not exist.
+    /// [`home_dir`], and rejects paths that do not exist.
     pub fn normalize_project_input(raw: &str) -> Result<std::path::PathBuf, GitError> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return Err(GitError::EmptyPath);
         }
-        let expanded = if trimmed == "~" || trimmed.starts_with("~/") {
-            match std::env::var("HOME") {
-                Ok(home) if !home.is_empty() => format!("{home}{}", &trimmed[1..]),
-                _ => trimmed.to_string(),
-            }
-        } else {
-            trimmed.to_string()
+        let is_tilde = trimmed == "~"
+            || trimmed.starts_with("~/")
+            || (cfg!(windows) && trimmed.starts_with("~\\"));
+        let expanded = match home_dir() {
+            Some(home) if is_tilde => format!("{}{}", home.display(), &trimmed[1..]),
+            _ => trimmed.to_string(),
         };
         let path = std::path::PathBuf::from(expanded);
         if !path.exists() {
@@ -189,6 +188,17 @@ impl Repo {
     }
 }
 
+/// The user's home directory: `$HOME`, falling back to `%USERPROFILE%` on
+/// Windows (where `HOME` is usually unset). `None` when neither is set.
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    let from = |var: &str| {
+        std::env::var_os(var)
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+    };
+    from("HOME").or_else(|| from("USERPROFILE").filter(|_| cfg!(windows)))
+}
+
 /// Free function so tests using raw `git2::Repository` don't need the wrapper.
 pub fn branch_name(repo: &git2::Repository) -> Result<String, GitError> {
     if repo.head_detached().unwrap_or(false) {
@@ -290,12 +300,21 @@ mod tests {
         assert_eq!(r.head_summary().unwrap(), "(no commits yet)");
     }
 
+    /// libgit2 reports long-form paths with `/` separators, while the temp
+    /// dir may be a Windows 8.3 short path (`RUNNER~1`); compare resolved.
+    fn assert_same_dir(a: &Path, b: &Path) {
+        assert_eq!(
+            std::fs::canonicalize(a).unwrap(),
+            std::fs::canonicalize(b).unwrap()
+        );
+    }
+
     #[test]
     fn workdir_returns_repo_root_for_tui_bootstrap() {
         let (dir, repo) = testutil::init_repo();
         testutil::commit_file(&repo, "a.txt", "x\n", "init");
         let r = Repo::from_inner(repo);
-        assert_eq!(r.workdir().unwrap(), dir.path());
+        assert_same_dir(&r.workdir().unwrap(), dir.path());
     }
 
     #[test]
@@ -354,7 +373,7 @@ mod tests {
         // empty (unborn, no-file) project.
         let nested = target.join("sub");
         std::fs::create_dir_all(&nested).unwrap();
-        assert_eq!(Repo::discover_root(&nested).unwrap(), target);
+        assert_same_dir(&Repo::discover_root(&nested).unwrap(), &target);
         assert!(r.status().unwrap().files.is_empty());
     }
 }

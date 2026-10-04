@@ -53,7 +53,7 @@ impl Workspace {
             if ws
                 .roots
                 .iter()
-                .any(|r| r == &std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone()))
+                .any(|r| r == &dunce::canonicalize(&root).unwrap_or_else(|_| root.clone()))
             {
                 continue;
             }
@@ -69,7 +69,7 @@ impl Workspace {
 
     /// Spawn one project tab for `root` (already a workdir). Switches to it.
     fn push_project(&mut self, root: &std::path::Path) -> Result<()> {
-        let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let canon = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         if let Some(i) = self.roots.iter().position(|r| *r == canon) {
             self.current = i;
             return Ok(());
@@ -130,7 +130,7 @@ impl Workspace {
     pub fn open_path(&mut self, path: PathBuf) {
         match Repo::discover_root(&path) {
             Ok(root) => {
-                let canon = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+                let canon = dunce::canonicalize(&root).unwrap_or_else(|_| root.clone());
                 if let Some(i) = self.roots.iter().position(|r| *r == canon) {
                     self.current = i;
                     self.current_mut().finish_open_project();
@@ -284,7 +284,7 @@ impl Workspace {
                 .set_browser_error(format!("not a directory: {}", path.display()));
             return;
         }
-        let dir = std::fs::canonicalize(&path).unwrap_or(path);
+        let dir = dunce::canonicalize(&path).unwrap_or(path);
         let ok = self
             .current_mut()
             .open_browser_mut()
@@ -320,7 +320,7 @@ impl Workspace {
         match Repo::init(&dir) {
             Ok(_) => match Repo::discover_root(&dir) {
                 Ok(root) => {
-                    let canon = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+                    let canon = dunce::canonicalize(&root).unwrap_or_else(|_| root.clone());
                     if let Some(i) = self.roots.iter().position(|r| *r == canon) {
                         self.current = i;
                         self.current_mut().finish_open_project();
@@ -764,7 +764,7 @@ mod tests {
         let browser = ws.current().open_browser().expect("browser is open");
         assert_eq!(
             browser.cwd,
-            std::fs::canonicalize(a.path()).unwrap(),
+            dunce::canonicalize(a.path()).unwrap(),
             "browser starts at the current project so siblings are nearby"
         );
         assert!(!browser.editing_path);
@@ -846,13 +846,13 @@ mod tests {
         ws.on_key(KeyCode::Right);
         assert_eq!(
             ws.current().open_browser().unwrap().cwd,
-            std::fs::canonicalize(&repo_dir).unwrap()
+            dunce::canonicalize(&repo_dir).unwrap()
         );
         // Back up to the parent.
         ws.on_key(KeyCode::Left);
         assert_eq!(
             ws.current().open_browser().unwrap().cwd,
-            std::fs::canonicalize(parent.path()).unwrap()
+            dunce::canonicalize(parent.path()).unwrap()
         );
     }
 
@@ -865,10 +865,10 @@ mod tests {
         assert!(ws.current().open_browser().unwrap().editing_path);
         type_text(&mut ws, "~");
         ws.on_key(KeyCode::Enter);
-        let home = std::env::var("HOME").unwrap();
+        let home = git_tui_core::repo::home_dir().unwrap();
         assert_eq!(
             ws.current().open_browser().unwrap().cwd,
-            std::fs::canonicalize(&home).unwrap()
+            dunce::canonicalize(&home).unwrap()
         );
     }
 
@@ -947,7 +947,7 @@ mod tests {
         ws.on_key(KeyCode::Backspace);
         assert_eq!(
             ws.current().open_browser().unwrap().cwd,
-            std::fs::canonicalize(&expected).unwrap()
+            dunce::canonicalize(&expected).unwrap()
         );
     }
 
@@ -1067,7 +1067,7 @@ mod tests {
         assert_eq!(ws.current().mode(), Mode::OpenProject);
         assert_eq!(
             ws.current().open_browser().unwrap().cwd,
-            std::fs::canonicalize(&plain).unwrap()
+            dunce::canonicalize(&plain).unwrap()
         );
         // `.` is highlighted inside the plain folder: Enter offers `git init`.
         ws.on_key(KeyCode::Enter);

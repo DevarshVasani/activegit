@@ -2965,6 +2965,8 @@ mod tests {
         let mut cfg = repo.config().unwrap();
         cfg.set_str("user.name", "Test User").unwrap();
         cfg.set_str("user.email", "test@example.com").unwrap();
+        // Git for Windows enables autocrlf system-wide; keep checkouts byte-exact.
+        cfg.set_str("core.autocrlf", "false").unwrap();
         (dir, repo)
     }
 
@@ -3917,6 +3919,9 @@ mod tests {
         assert_eq!(app.diff().unwrap().path, "b.txt");
     }
 
+    // Needs a mode-only change, which only exists where the filesystem
+    // has an executable bit.
+    #[cfg(unix)]
     #[test]
     fn empty_diff_falls_back_to_whole_file_automatically() {
         use std::os::unix::fs::PermissionsExt;
@@ -4122,6 +4127,7 @@ mod tests {
     #[test]
     fn sync_modal_from_fullscreen_returns_to_fullscreen() {
         let mut fx = harness(&["a.txt"]);
+        wait_for_sync(&mut fx.app);
         fx.app.on_key(KeyCode::Enter);
         assert_eq!(fx.app.mode(), Mode::FullDiff);
         // Harness repos have no remotes: `P` opens the publish modal.

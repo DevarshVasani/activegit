@@ -76,13 +76,20 @@ credential helpers keep working unchanged.
 
 ## Install
 
-Prebuilt binaries for **Linux** and **macOS** (x86_64 and ARM64). You also need a
-`git` CLI on `PATH` (used for push/pull).
+Prebuilt binaries for **Linux** and **macOS** (x86_64 and ARM64) and **Windows**
+(x86_64). You also need a `git` CLI on `PATH` (used for push/pull); on Windows,
+[Git for Windows](https://git-scm.com/download/win) provides it.
 
 **Shell installer**
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/DevarshVasani/activegit/releases/latest/download/activegit-installer.sh | sh
+```
+
+**PowerShell installer** (Windows)
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/DevarshVasani/activegit/releases/latest/download/activegit-installer.ps1 | iex"
 ```
 
 **mise**
@@ -93,7 +100,10 @@ mise use -g github:DevarshVasani/activegit
 
 **Manual download:** grab the archive for your platform from the
 [latest release](https://github.com/DevarshVasani/activegit/releases/latest),
-unpack it, and put `activegit` somewhere on your `PATH`.
+unpack it, and put `activegit` (`activegit.exe` on Windows) somewhere on your `PATH`.
+
+On Windows, use a modern terminal such as **Windows Terminal**; the legacy
+console host has limited color and key support.
 
 <details>
 <summary><b>Build from source</b> (Rust 1.88+)</summary>
@@ -107,7 +117,10 @@ git clone https://github.com/DevarshVasani/activegit && cd activegit
 cargo install --locked --path git-tui
 ```
 
-Both install `activegit` into `~/.cargo/bin`; make sure that's on your `PATH`.
+Both install `activegit` into `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` on
+Windows); make sure that's on your `PATH`. Building on Windows needs the MSVC
+C++ build tools (Visual Studio Build Tools with the "Desktop development with
+C++" workload).
 
 </details>
 
@@ -209,7 +222,8 @@ credentials fail fast instead of hanging.
 ## Configuration
 
 Config lives in `~/.config/activegit/config.toml` (or
-`$XDG_CONFIG_HOME/activegit/config.toml`). A missing file means defaults;
+`$XDG_CONFIG_HOME/activegit/config.toml`; on Windows
+`%APPDATA%\activegit\config.toml`). A missing file means defaults;
 unknown actions, keys, or sections fail fast and name the offending value.
 
 ```toml
