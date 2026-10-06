@@ -9,7 +9,7 @@ use git_tui_core::diff::FileDiff;
 use git_tui_core::error::GitError;
 use git_tui_core::jobqueue::{AsyncJob, AsyncResult, JobQueue};
 use git_tui_core::llm::LlmConfig;
-use git_tui_core::log::CommitInfo;
+use git_tui_core::log::{CommitInfo, CommitOverview};
 use git_tui_core::stash::StashEntry;
 use git_tui_core::status::{FileState, RepoStatus, StatusEntry};
 use git_tui_core::sync::SyncStatus;
@@ -184,7 +184,14 @@ pub struct App {
     branches: Option<Vec<BranchInfo>>,
     branch_selected: usize,
     log: Option<Vec<CommitInfo>>,
-    log_scroll: u16,
+    log_selected: usize,
+    /// Full detail for the selected commit (message, author, file stat),
+    /// shown in the [5] panel while `Focus::Log` is active.
+    commit_overview: Option<CommitOverview>,
+    /// Oid the loaded/loading `commit_overview` belongs to, so a stale
+    /// in-flight load for a since-abandoned selection is dropped on
+    /// arrival instead of overwriting the new selection's panel.
+    commit_overview_for: Option<String>,
     stash: Option<Vec<StashEntry>>,
     stash_selected: usize,
     /// Upstream tracking state (upstream ref, ahead/behind, remotes).
@@ -197,6 +204,7 @@ pub struct App {
     // (which only gets `&App`) can follow the selection without a `&mut`.
     files_scroll: Cell<usize>,
     branch_scroll: Cell<usize>,
+    log_scroll: Cell<usize>,
     stash_scroll: Cell<usize>,
     /// Content width of the commit box as last rendered. The renderer
     /// records it so ↑/↓ move by the same soft-wrapped rows the user sees.
@@ -555,13 +563,16 @@ impl App {
             branches: None,
             branch_selected: 0,
             log: None,
-            log_scroll: 0,
+            log_selected: 0,
+            commit_overview: None,
+            commit_overview_for: None,
             stash: None,
             stash_selected: 0,
             sync: None,
             syncing: None,
             files_scroll: Cell::new(0),
             branch_scroll: Cell::new(0),
+            log_scroll: Cell::new(0),
             stash_scroll: Cell::new(0),
             // Default matches the commit modal's usual inner width (60 − 2
             // borders) until the renderer records the real one.
@@ -810,6 +821,14 @@ impl App {
 
     pub(crate) fn set_branch_scroll(&self, off: usize) {
         self.branch_scroll.set(off);
+    }
+
+    pub(crate) fn log_scroll(&self) -> usize {
+        self.log_scroll.get()
+    }
+
+    pub(crate) fn set_log_scroll(&self, off: usize) {
+        self.log_scroll.set(off);
     }
 
     pub(crate) fn stash_scroll(&self) -> usize {
@@ -1135,8 +1154,12 @@ impl App {
         self.log.as_deref()
     }
 
-    pub fn log_scroll(&self) -> u16 {
-        self.log_scroll
+    pub fn log_selected(&self) -> usize {
+        self.log_selected
+    }
+
+    pub fn commit_overview(&self) -> Option<&CommitOverview> {
+        self.commit_overview.as_ref()
     }
 
     pub fn stash(&self) -> Option<&[StashEntry]> {
@@ -1535,9 +1558,25 @@ impl App {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_branch_selected_for_test(&mut self, index: usize) {
+        self.branch_selected = index;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_stash_selected_for_test(&mut self, index: usize) {
+        self.stash_selected = index;
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_log_for_test(&mut self, entries: Vec<CommitInfo>) {
         self.log = Some(entries);
-        self.log_scroll = 0;
+        self.log_selected = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_commit_overview_for_test(&mut self, overview: CommitOverview) {
+        self.commit_overview_for = Some(overview.oid.clone());
+        self.commit_overview = Some(overview);
     }
 
     #[cfg(test)]
@@ -1592,7 +1631,9 @@ impl App {
 
     /// Modifier-aware dispatch (the event loop calls this). Only Shift+A
     /// generates a message in the commit box, so a literal `A` (caps lock
-    /// or otherwise without Shift) still types normally.
+    /// or otherwise without Shift) still types normally. Shift+Down/Up
+    /// mirror `J`/`K` (hunk jumps) in Normal and FullDiff modes; text
+    /// modals and the finder keep plain arrow-key behavior.
     pub fn on_key_with_modifiers(&mut self, key: KeyCode, shift_held: bool) {
         // A new action dismisses the previous error/notice; async failures
         // from this action arrive later via `poll` and replace them.
@@ -1612,6 +1653,21 @@ impl App {
             self.focus = Focus::Diff;
             return;
         }
+        // Shift+Down/Up behave exactly like `J`/`K` wherever those apply
+        // (hunk jumps in the diff preview and fullscreen). Mapping to the
+        // `J`/`K` KeyCodes — rather than duplicating each arm — keeps the
+        // markdown-preview guards and clamps in lockstep automatically.
+        // Gated to Normal/FullDiff so Shift+arrows keep editing text in
+        // commit/branch/stash prompts and moving the finder selection.
+        let key = match (key, shift_held) {
+            (KeyCode::Down, true) if matches!(self.mode, Mode::Normal | Mode::FullDiff) => {
+                KeyCode::Char('J')
+            }
+            (KeyCode::Up, true) if matches!(self.mode, Mode::Normal | Mode::FullDiff) => {
+                KeyCode::Char('K')
+            }
+            _ => key,
+        };
         self.on_key_inner(key);
     }
 
@@ -1795,6 +1851,9 @@ impl App {
         } else if k.stage.contains(&key) {
             if self.focus == Focus::Status {
                 self.toggle_stage();
+            } else if self.focus == Focus::Diff {
+                // Same as fullscreen space: stage the hunk under the cursor.
+                self.stage_selected_hunk();
             }
         } else if k.discard.contains(&key) {
             if self.focus == Focus::Status {
@@ -1924,9 +1983,11 @@ impl App {
                     .saturating_add(1)
                     .min(self.branch_count().saturating_sub(1));
             }
-            // Read-only log: navigation scrolls.
             Focus::Log => {
-                self.scroll_log_by(1);
+                self.log_selected = self
+                    .log_selected
+                    .saturating_add(1)
+                    .min(self.log_count().saturating_sub(1));
             }
             Focus::Stash => {
                 self.stash_selected = self
@@ -1949,7 +2010,7 @@ impl App {
                 self.branch_selected = self.branch_selected.saturating_sub(1);
             }
             Focus::Log => {
-                self.scroll_log_by(-1);
+                self.log_selected = self.log_selected.saturating_sub(1);
             }
             Focus::Stash => {
                 self.stash_selected = self.stash_selected.saturating_sub(1);
@@ -2323,7 +2384,14 @@ impl App {
             }
         } else if mouse_in(col, row, layout.commits) {
             self.focus = Focus::Log;
-            self.scroll_log_by(delta);
+            let n = self.log_count();
+            if n > 0 {
+                if up {
+                    self.log_selected = self.log_selected.saturating_sub(3);
+                } else {
+                    self.log_selected = (self.log_selected + 3).min(n - 1);
+                }
+            }
         } else if mouse_in(col, row, layout.stash) {
             self.focus = Focus::Stash;
             let n = self.stash_count();
@@ -2360,6 +2428,11 @@ impl App {
             });
         } else if mouse_in(col, row, layout.commits) {
             self.focus = Focus::Log;
+            let scroll = self.log_scroll.get();
+            let count = self.log_count();
+            self.click_list_row(row, layout.commits, scroll, count, |app, i| {
+                app.log_selected = i;
+            });
         } else if mouse_in(col, row, layout.stash) {
             self.focus = Focus::Stash;
             let scroll = self.stash_scroll.get();
@@ -2370,7 +2443,14 @@ impl App {
         } else if mouse_in(col, row, layout.diff) {
             self.focus = Focus::Diff;
             if let Some(idx) = self.hit(HitMap::Preview, row) {
-                self.point_cursor_at(idx);
+                // Same as fullscreen: header click jumps to that hunk,
+                // row click moves the cursor there.
+                if let Some(crate::ui::DiffRow::Header { index }) = self.diff_rows.get(idx) {
+                    let index = *index;
+                    self.point_hunk_at(index);
+                } else {
+                    self.point_cursor_at(idx);
+                }
             }
         }
     }
@@ -2874,16 +2954,34 @@ impl App {
         self.diff_scroll = (cur + delta).clamp(0, max as isize) as u16;
     }
 
-    /// Scroll the log by `delta` lines, clamped to the loaded entries.
-    fn scroll_log_by(&mut self, delta: isize) {
-        let max = self
-            .log
-            .as_ref()
-            .map(|l| l.len().saturating_sub(1))
-            .unwrap_or(0)
-            .min(u16::MAX as usize) as isize;
-        let cur = self.log_scroll as isize;
-        self.log_scroll = (cur + delta).clamp(0, max) as u16;
+    fn log_count(&self) -> usize {
+        self.log.as_ref().map(|l| l.len()).unwrap_or(0)
+    }
+
+    fn selected_commit(&self) -> Option<CommitInfo> {
+        self.log
+            .as_ref()?
+            .get(self.log_selected.min(self.log_count().saturating_sub(1)))
+            .cloned()
+    }
+
+    /// Request the selected commit's detail unless it is already
+    /// loaded/loading (matches `maybe_load_diff`'s per-tick, idempotent
+    /// shape — cheap to call from `poll` every frame).
+    fn maybe_load_commit_overview(&mut self) {
+        let Some(commit) = self.selected_commit() else {
+            self.commit_overview = None;
+            self.commit_overview_for = None;
+            return;
+        };
+        if self.commit_overview_for.as_deref() == Some(commit.oid.as_str()) {
+            return;
+        }
+        self.commit_overview_for = Some(commit.oid.clone());
+        self.commit_overview = None;
+        if let Err(e) = self.queue.submit(AsyncJob::LoadCommitOverview { oid: commit.oid }) {
+            self.error = Some(e.to_string());
+        }
     }
 
     /// Space: stage unless already fully staged (then unstage). When the
@@ -3629,6 +3727,7 @@ impl App {
             self.maybe_load_diff();
             self.maybe_load_markdown();
         }
+        self.maybe_load_commit_overview();
     }
 
     fn apply(&mut self, result: AsyncResult) {
@@ -3688,8 +3787,14 @@ impl App {
                 self.branches = Some(b);
             }
             AsyncResult::Log(entries) => {
-                self.log_scroll = self.log_scroll.min(entries.len().saturating_sub(1) as u16);
+                self.log_selected = self.log_selected.min(entries.len().saturating_sub(1));
                 self.log = Some(entries);
+            }
+            AsyncResult::CommitOverview(overview) => {
+                // Drop overtaken loads: only the still-selected oid counts.
+                if self.commit_overview_for.as_deref() == Some(overview.oid.as_str()) {
+                    self.commit_overview = Some(overview);
+                }
             }
             AsyncResult::Stash(entries) => {
                 self.stash_selected = self.stash_selected.min(entries.len().saturating_sub(1));
@@ -5638,6 +5743,56 @@ mod tests {
     }
 
     #[test]
+    fn shift_down_up_mirror_jk_in_fullscreen() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+        fx.app.on_key_with_modifiers(KeyCode::Down, true);
+        assert_eq!(fx.app.hunk(), 1, "Shift+Down must jump like J");
+        fx.app.on_key_with_modifiers(KeyCode::Down, true);
+        assert_eq!(fx.app.hunk(), 1, "clamps at last hunk like J");
+        fx.app.on_key_with_modifiers(KeyCode::Up, true);
+        assert_eq!(fx.app.hunk(), 0, "Shift+Up must jump like K");
+        // Plain arrows still move line-by-line.
+        fx.app.on_key(KeyCode::Down);
+        assert_eq!(fx.app.hunk(), 0, "plain Down must not jump hunks");
+    }
+
+    #[test]
+    fn shift_down_up_mirror_jk_in_preview() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Char('5'));
+        assert_eq!(fx.app.focus(), Focus::Diff);
+        fx.app.on_key_with_modifiers(KeyCode::Down, true);
+        assert_eq!(fx.app.hunk(), 1, "preview Shift+Down must jump like J");
+        fx.app.on_key_with_modifiers(KeyCode::Up, true);
+        assert_eq!(fx.app.hunk(), 0, "preview Shift+Up must jump like K");
+    }
+
+    #[test]
+    fn shift_down_up_noop_where_j_noops() {
+        let mut fx = harness(&["a.txt", "b.txt"]);
+        // File list: J has no binding, so Shift+Down must also do nothing.
+        let before = fx.app.selected();
+        fx.app.on_key_with_modifiers(KeyCode::Down, true);
+        assert_eq!(fx.app.selected(), before);
+        fx.app.on_key_with_modifiers(KeyCode::Up, true);
+        assert_eq!(fx.app.selected(), before);
+    }
+
+    #[test]
+    fn shift_arrows_keep_arrow_behavior_in_finder() {
+        let mut fx = harness(&["a.txt", "b.txt", "c.txt"]);
+        fx.app.on_key(KeyCode::Char('/'));
+        assert_eq!(fx.app.mode(), Mode::FindFile);
+        fx.app.on_key_with_modifiers(KeyCode::Down, true);
+        assert_eq!(fx.app.finder_cursor(), 1);
+        assert_eq!(fx.app.draft(), "", "must not type J into the filter");
+        fx.app.on_key_with_modifiers(KeyCode::Up, true);
+        assert_eq!(fx.app.finder_cursor(), 0);
+    }
+
+    #[test]
     fn line_cursor_clamps_at_ends() {
         let mut fx = two_hunk_fixture();
         fx.app.on_key(KeyCode::Enter);
@@ -6203,6 +6358,88 @@ mod tests {
         let entries = wait_for_log(&mut fx.app, 2);
         assert_eq!(entries[0].summary, "second");
         assert_eq!(entries[1].summary, "init");
+    }
+
+    #[test]
+    fn j_k_move_the_log_selection_and_clamp_at_ends() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char(' '));
+        wait_for(&mut fx.app, |st| {
+            st.files
+                .iter()
+                .any(|e| e.path == "a.txt" && e.state == FileState::Staged)
+        });
+        fx.app.on_key(KeyCode::Char('c'));
+        for c in "second".chars() {
+            fx.app.on_key(KeyCode::Char(c));
+        }
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.on_key(KeyCode::Char('3'));
+        wait_for_log(&mut fx.app, 2);
+        assert_eq!(fx.app.log_selected(), 0);
+        fx.app.on_key(KeyCode::Char('j'));
+        assert_eq!(fx.app.log_selected(), 1, "j must move to the next commit");
+        fx.app.on_key(KeyCode::Char('j'));
+        assert_eq!(fx.app.log_selected(), 1, "must clamp at the oldest commit");
+        fx.app.on_key(KeyCode::Char('k'));
+        assert_eq!(fx.app.log_selected(), 0, "k must move back up");
+        fx.app.on_key(KeyCode::Char('k'));
+        assert_eq!(fx.app.log_selected(), 0, "must clamp at the newest commit");
+    }
+
+    fn wait_for_commit_overview(
+        app: &mut App,
+        oid: &str,
+    ) -> git_tui_core::log::CommitOverview {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.poll();
+            if let Some(o) = app.commit_overview() {
+                if o.oid == oid {
+                    return o.clone();
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for commit overview of {oid}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn selecting_a_commit_loads_its_overview() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('3'));
+        let entries = wait_for_log(&mut fx.app, 1);
+        let overview = wait_for_commit_overview(&mut fx.app, &entries[0].oid);
+        assert_eq!(overview.summary, "init");
+        assert_eq!(overview.author, "Test User");
+        assert_eq!(overview.files.len(), 1);
+        assert_eq!(overview.files[0].path, "a.txt");
+    }
+
+    #[test]
+    fn moving_the_log_selection_switches_the_overview() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char(' '));
+        wait_for(&mut fx.app, |st| {
+            st.files
+                .iter()
+                .any(|e| e.path == "a.txt" && e.state == FileState::Staged)
+        });
+        fx.app.on_key(KeyCode::Char('c'));
+        for c in "second".chars() {
+            fx.app.on_key(KeyCode::Char(c));
+        }
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.on_key(KeyCode::Char('3'));
+        let entries = wait_for_log(&mut fx.app, 2);
+        let top = wait_for_commit_overview(&mut fx.app, &entries[0].oid);
+        assert_eq!(top.summary, "second");
+        fx.app.on_key(KeyCode::Char('j'));
+        let bottom = wait_for_commit_overview(&mut fx.app, &entries[1].oid);
+        assert_eq!(bottom.summary, "init");
     }
 
     fn wait_for_stash(app: &mut App, count: usize) -> Vec<StashEntry> {

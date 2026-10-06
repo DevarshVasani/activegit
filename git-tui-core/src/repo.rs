@@ -182,6 +182,10 @@ impl Repo {
         crate::log::log(&self.inner, limit)
     }
 
+    pub fn commit_overview(&self, oid: &str) -> Result<crate::log::CommitOverview, GitError> {
+        crate::log::commit_overview(&self.inner, oid)
+    }
+
     pub fn list_stash(&mut self) -> Result<Vec<crate::stash::StashEntry>, GitError> {
         crate::stash::list_stash(&mut self.inner)
     }

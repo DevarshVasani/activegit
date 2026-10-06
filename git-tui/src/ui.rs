@@ -9,7 +9,7 @@ use crate::words::{word_diff, WordSeg};
 use crate::workspace::Workspace;
 use git_tui_core::branch::BranchInfo;
 use git_tui_core::diff::{FileDiff, LineKind};
-use git_tui_core::log::CommitInfo;
+use git_tui_core::log::{compute_lanes, CommitInfo};
 use git_tui_core::stash::StashEntry;
 use git_tui_core::status::{FileState, StatusEntry};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -280,7 +280,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         area,
     );
     // Two-line footer: mouse buttons + keyboard hints.
-    let layout = compute_layout(area, 2, app.layout_overrides());
+    let layout = compute_layout_focused(area, 2, app.layout_overrides(), app.focus());
     app.set_last_layout(layout);
 
     render_status_panel(frame, layout.status, app);
@@ -345,7 +345,7 @@ pub fn render_workspace(frame: &mut Frame, ws: &Workspace) {
     render_project_bar(frame, bar, ws);
     let app = ws.current();
     // Two-line footer: mouse buttons + keyboard hints.
-    let layout = compute_layout(body, 2, app.layout_overrides());
+    let layout = compute_layout_focused(body, 2, app.layout_overrides(), app.focus());
     app.set_last_layout(layout);
 
     render_status_panel(frame, layout.status, app);
@@ -534,6 +534,100 @@ pub(crate) fn rail_divider_x(layout: &ScreenLayout) -> u16 {
 pub(crate) fn panel_divider_ys(layout: &ScreenLayout) -> [u16; 4] {
     let panels = [layout.status, layout.files, layout.branches, layout.commits];
     panels.map(|r| r.y.saturating_add(r.height.saturating_sub(1)))
+}
+
+/// Rail panel index that grows while it holds keyboard focus: status
+/// focus drives the files panel (`[1]-Files`), branches/commits/stash
+/// drive their own panels. `Diff` widens the preview instead, so this
+/// returns `None` for it.
+fn rail_focus_index(focus: Focus) -> Option<usize> {
+    match focus {
+        Focus::Status => Some(1),
+        Focus::Branches => Some(2),
+        Focus::Log => Some(3),
+        Focus::Stash => Some(4),
+        Focus::Diff => None,
+    }
+}
+
+/// Focus-aware geometry: the section you are in automatically renders
+/// bigger. Rail focus grows that panel (stealing rows from the roomiest
+/// siblings, never below [`MIN_PANEL_H`]); diff focus narrows the rail
+/// so the preview gains columns. Pure function of area + overrides +
+/// focus, so a focus change resizes on the very next frame with no
+/// stored state. Explicit divider drags still apply first — focus only
+/// redistributes what remains.
+pub(crate) fn compute_layout_focused(
+    area: Rect,
+    footer_h: u16,
+    overrides: LayoutOverrides,
+    focus: Focus,
+) -> ScreenLayout {
+    let body_h = area.height.saturating_sub(footer_h.min(area.height));
+    let mut wants = [3, body_h.saturating_sub(16).max(3), 5, 4, 4];
+    for (i, o) in overrides.heights.iter().enumerate() {
+        if let Some(h) = o {
+            wants[i] = (*h).max(MIN_PANEL_H);
+        }
+    }
+    let mut rail_w = overrides.rail_w;
+    if let Some(idx) = rail_focus_index(focus) {
+        // Target ~45% of the rail, at least 10 rows, never shrinking.
+        let target = (body_h * 45 / 100).max(10).max(wants[idx]);
+        // Leave every other panel its minimum.
+        let max_allowed = body_h.saturating_sub(MIN_PANEL_H * 4);
+        if target > wants[idx] && max_allowed > wants[idx] {
+            let desired = target.min(max_allowed);
+            if idx == 4 {
+                // Stash takes the remainder: free rows by shrinking 0..4.
+                let remainder = body_h.saturating_sub(wants[0] + wants[1] + wants[2] + wants[3]);
+                let mut need = desired.saturating_sub(remainder);
+                let mut peers = [0, 1, 2, 3];
+                peers.sort_by_key(|&p| std::cmp::Reverse(wants[p]));
+                for p in peers {
+                    if need == 0 {
+                        break;
+                    }
+                    let reducible = wants[p].saturating_sub(MIN_PANEL_H);
+                    let take = reducible.min(need);
+                    wants[p] -= take;
+                    need -= take;
+                }
+            } else {
+                let mut extra = desired - wants[idx];
+                let mut peers: Vec<usize> = (0..4).filter(|&p| p != idx).collect();
+                peers.sort_by_key(|&p| std::cmp::Reverse(wants[p]));
+                for p in peers {
+                    if extra == 0 {
+                        break;
+                    }
+                    let reducible = wants[p].saturating_sub(MIN_PANEL_H);
+                    let take = reducible.min(extra);
+                    wants[p] -= take;
+                    extra -= take;
+                }
+                wants[idx] = desired - extra;
+            }
+        }
+    } else {
+        // Diff focus: narrow the rail to 2/3 so the preview grows.
+        let base = rail_w.unwrap_or_else(|| default_rail_w(area.width));
+        rail_w = Some((base * 2 / 3).max(MIN_RAIL_W.min(area.width)));
+    }
+    compute_layout(
+        area,
+        footer_h,
+        LayoutOverrides {
+            rail_w,
+            heights: [
+                Some(wants[0]),
+                Some(wants[1]),
+                Some(wants[2]),
+                Some(wants[3]),
+                Some(wants[4]),
+            ],
+        },
+    )
 }
 
 /// Minimal-scroll follow: keep `selected` visible inside a `visible`-row
@@ -1610,6 +1704,12 @@ fn render_diff_preview_panel(frame: &mut Frame, area: Rect, app: &App) {
     if area.is_empty() {
         return;
     }
+    // Browsing commits: the [5] panel mirrors the Commits selection (full
+    // message, identity, file stat) instead of the status file diff.
+    if app.focus() == Focus::Log {
+        render_commit_overview_panel(frame, area, app);
+        return;
+    }
     // Recorded for the cursor-follow math in `App` (see fullscreen).
     app.set_prev_view_h(area.height.saturating_sub(2) as usize);
     let theme = app.theme();
@@ -2146,12 +2246,12 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
         Mode::Normal if app.focus() == Focus::Branches => {
             "enter checkout · a new branch · D delete · tab commits · q close · Q quit"
         }
-        Mode::Normal if app.focus() == Focus::Log => "j/k scroll · tab stash · r refresh · q close · Q quit",
+        Mode::Normal if app.focus() == Focus::Log => "j/k select · tab stash · r refresh · q close · Q quit",
         Mode::Normal if app.focus() == Focus::Stash => {
             "enter pop · a stash · D drop · tab files · q close · Q quit"
         }
         Mode::Normal if app.focus() == Focus::Diff => {
-            "j/k/↑/↓ line · J/K hunk · h/l col · v/V select · y yank · x restore hunk · PgUp/PgDn page · enter full screen · ←/1 files · tab files · q close · Q quit"
+            "j/k/↑/↓ line · J/K hunk · h/l col · v/V select · y yank · space stage hunk · x restore hunk · PgUp/PgDn page · enter full screen · ←/1 files · tab files · q close · Q quit"
         }
         Mode::FindFile => "type to filter · ↑/↓ move · ←/→ edit · enter open · esc cancel",
         Mode::LlmSettings => "tab/↑↓ switch field · ←/→ choose/edit · enter save · esc cancel",
@@ -3051,24 +3151,106 @@ fn render_branches_panel(frame: &mut Frame, area: Rect, app: &App) {
     let visible = area.height.saturating_sub(2) as usize;
     let off = follow_selection(sel, visible, app.branch_scroll());
     app.set_branch_scroll(off);
-    let list = List::new(branch_list_items(branches, theme))
-        .block(panel_block(
-            focused,
-            theme,
-            format!("[2]-Local branches ({} of {})", sel + 1, branches.len()),
-        ))
-        .highlight_style(selection_style(theme))
-        .highlight_symbol("> ");
+    // Slice to the scrolled window (like the files panel): the highlight
+    // index is relative to the visible rows, so the list actually scrolls
+    // instead of pinning the highlight to the wrong row.
+    let items = branch_list_items(branches, theme);
+    let list = List::new(
+        items
+            .into_iter()
+            .skip(off)
+            .take(visible)
+            .collect::<Vec<_>>(),
+    )
+    .block(panel_block(
+        focused,
+        theme,
+        format!("[2]-Local branches ({} of {})", sel + 1, branches.len()),
+    ))
+    .highlight_style(selection_style(theme))
+    .highlight_symbol("> ");
     let mut state = ListState::default();
     state.select((visible > 0).then(|| sel.saturating_sub(off)));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+/// Lane color for the commit graph: cycles a small palette so adjacent
+/// lanes stay distinguishable on every theme.
+fn graph_lane_color(theme: Theme, lane: usize) -> Color {
+    const SLOTS: [fn(Theme) -> Color; 6] = [
+        |t| t.branch_current,
+        |t| t.commit_id,
+        |t| t.hunk_header,
+        |t| t.both_staged,
+        |t| t.syntax_function,
+        |t| t.syntax_type,
+    ];
+    SLOTS[lane % SLOTS.len()](theme)
+}
+
+/// Two-letter author initials, like `VD` / `Aa` in the reflog graph.
+/// First ASCII alphanumerics of the first and last word (`"Test User"` →
+/// `"TU"`); single-word names use their first two characters.
+fn author_initials(author: &str) -> String {
+    let words: Vec<&str> = author.split_whitespace().collect();
+    let first = words
+        .first()
+        .and_then(|w| w.chars().find(|c| c.is_alphanumeric()));
+    let last = words
+        .last()
+        .and_then(|w| w.chars().find(|c| c.is_alphanumeric()));
+    match (first, last) {
+        (Some(a), Some(b)) if words.len() > 1 => {
+            format!("{}{}", a.to_ascii_uppercase(), b.to_ascii_uppercase())
+        }
+        (Some(a), _) => {
+            let mut chars = words
+                .first()
+                .unwrap_or(&"??")
+                .chars()
+                .filter(|c| c.is_alphanumeric());
+            let x = a.to_ascii_uppercase();
+            let y = chars.nth(1).map(|c| c.to_ascii_uppercase()).unwrap_or('?');
+            format!("{x}{y}")
+        }
+        _ => "??".to_string(),
+    }
+}
+
+/// Reflog-style commit rows: `<id> <initials> <graph> <tags> <summary>`,
+/// where the graph is an inline lane segment — a filled `●` on the commit's
+/// lane when pushed, an open `○` when still local-only (yet to push), `│`
+/// on the other active lanes, joined with `─` across merges and fork/close
+/// rows. Every lane keeps its own color, so each branch reads as its own
+/// colored thread (node, rails, and initials all share it).
 fn log_lines(entries: &[CommitInfo], theme: Theme) -> Vec<Line<'static>> {
+    let lanes = compute_lanes(entries);
     entries
         .iter()
-        .map(|e| {
-            Line::from(vec![
+        .enumerate()
+        .map(|(i, e)| {
+            let row = lanes
+                .get(i)
+                .copied()
+                .unwrap_or(git_tui_core::log::GraphRow {
+                    lane: 0,
+                    width: 1,
+                    is_merge: e.is_merge(),
+                });
+            // Cap rendered lanes so a very branchy repo can't push the
+            // message off the narrow left rail.
+            let width = row.width.clamp(1, 8);
+            let lane = row.lane.min(width - 1);
+            let prev_width = if i > 0 {
+                lanes.get(i - 1).map(|r| r.width.clamp(1, 8)).unwrap_or(1)
+            } else {
+                width
+            };
+            // Merges and fork/close rows join lanes with `─`; steady-state
+            // rows just stand the rails side by side.
+            let joined = row.is_merge || width != prev_width;
+            let lane_color = graph_lane_color(theme, lane);
+            let mut spans = vec![
                 Span::styled(
                     e.id.clone(),
                     Style::default()
@@ -3076,9 +3258,57 @@ fn log_lines(entries: &[CommitInfo], theme: Theme) -> Vec<Line<'static>> {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
-                Span::raw(e.summary.clone()),
-                Span::styled(format!("  — {}", e.author), Style::default().fg(theme.hint)),
-            ])
+                Span::styled(
+                    author_initials(&e.author),
+                    Style::default().fg(lane_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+            ];
+            for l in 0..width {
+                let color = graph_lane_color(theme, l);
+                let glyph = if l == lane {
+                    if e.pushed {
+                        "●"
+                    } else {
+                        "○"
+                    }
+                } else {
+                    "│"
+                };
+                spans.push(Span::styled(
+                    glyph.to_string(),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ));
+                if l + 1 < width {
+                    spans.push(Span::styled(
+                        if joined { "─" } else { " " }.to_string(),
+                        Style::default().fg(lane_color),
+                    ));
+                }
+            }
+            // Tags render bare (`v0.2.2`, yellow); branch refs stay
+            // parenthesized green (`(HEAD -> main, side)`).
+            let (tags, branches): (Vec<&String>, Vec<&String>) =
+                e.refs.iter().partition(|r| r.starts_with("tag: "));
+            for tag in tags {
+                spans.push(Span::styled(
+                    format!(" {}", tag.trim_start_matches("tag: ")),
+                    Style::default()
+                        .fg(theme.commit_id)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            if !branches.is_empty() {
+                let names: Vec<&str> = branches.iter().map(|s| s.as_str()).collect();
+                spans.push(Span::styled(
+                    format!(" ({})", names.join(", ")),
+                    Style::default()
+                        .fg(theme.branch_current)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            spans.push(Span::raw(format!(" {}", e.summary)));
+            Line::from(spans)
         })
         .collect()
 }
@@ -3111,14 +3341,129 @@ fn render_commits_panel(frame: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
-    frame.render_widget(
-        Paragraph::new(log_lines(entries, theme))
-            .block(panel_block(
+    let sel = app.log_selected().min(entries.len().saturating_sub(1));
+    let visible = area.height.saturating_sub(2) as usize;
+    let off = follow_selection(sel, visible, app.log_scroll());
+    app.set_log_scroll(off);
+    let items: Vec<ListItem<'static>> = log_lines(entries, theme)
+        .into_iter()
+        .map(ListItem::new)
+        .skip(off)
+        .take(visible)
+        .collect();
+    let list = List::new(items)
+        .block(panel_block(
+            focused,
+            theme,
+            format!("[3]-Commits ({} of {})", sel + 1, entries.len()),
+        ))
+        .highlight_style(selection_style(theme))
+        .highlight_symbol("> ");
+    let mut state = ListState::default();
+    state.select((visible > 0).then(|| sel.saturating_sub(off)));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// The selected commit's detail, shown in the [5] panel while the
+/// Commits panel is focused: `git show --stat` distilled to message,
+/// identity and a per-file change count — mirrors `render_diff_preview_panel`
+/// but keyed off the log selection instead of the status file list.
+fn render_commit_overview_panel(frame: &mut Frame, area: Rect, app: &App) {
+    if area.is_empty() {
+        return;
+    }
+    let theme = app.theme();
+    let focused = app.focus() == Focus::Diff;
+    let Some(entries) = app.log() else {
+        frame.render_widget(
+            Paragraph::new("").block(panel_block(focused, theme, " [5]-Commit ".to_string())),
+            area,
+        );
+        return;
+    };
+    if entries.is_empty() {
+        frame.render_widget(
+            Paragraph::new("").block(panel_block(focused, theme, " [5]-Commit ".to_string())),
+            area,
+        );
+        return;
+    }
+    let Some(overview) = app.commit_overview() else {
+        frame.render_widget(
+            Paragraph::new("loading…").block(panel_block(
                 focused,
                 theme,
-                format!("[3]-Commits ({})", entries.len()),
-            ))
-            .scroll((app.log_scroll(), 0)),
+                " [5]-Commit (loading…) ".to_string(),
+            )),
+            area,
+        );
+        return;
+    };
+    let title = format!(" [5]-Commit {} ", overview.id);
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(
+            format!("commit {}", overview.oid),
+            Style::default()
+                .fg(theme.commit_id)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!("Author: {} <{}>", overview.author, overview.email)),
+        Line::from(format!("Date:   {}", overview.date)),
+        Line::from(""),
+        Line::from(Span::styled(
+            overview.summary.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+    ];
+    for body_line in overview.body.lines() {
+        lines.push(Line::from(format!("    {body_line}")));
+    }
+    lines.push(Line::from(""));
+    if overview.files.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(no file changes)",
+            Style::default().fg(theme.hint),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} file{} changed, +{} -{}",
+                overview.files.len(),
+                if overview.files.len() == 1 { "" } else { "s" },
+                overview.insertions,
+                overview.deletions,
+            ),
+            Style::default().fg(theme.hint),
+        )));
+        for file in &overview.files {
+            let status_color = match file.status {
+                'A' => theme.staged,
+                'D' => theme.conflicted,
+                _ => theme.hint,
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {} ", file.status),
+                    Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(file.path.clone()),
+                Span::raw("  "),
+                Span::styled(
+                    format!("+{}", file.insertions),
+                    Style::default().fg(theme.staged),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    format!("-{}", file.deletions),
+                    Style::default().fg(theme.conflicted),
+                ),
+            ]));
+        }
+    }
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let shown: Vec<Line<'static>> = lines.into_iter().take(inner_h.max(1)).collect();
+    frame.render_widget(
+        Paragraph::new(shown).block(panel_block(focused, theme, title)),
         area,
     );
 }
@@ -3168,14 +3513,22 @@ fn render_stash_panel(frame: &mut Frame, area: Rect, app: &App) {
     let visible = area.height.saturating_sub(2) as usize;
     let off = follow_selection(sel, visible, app.stash_scroll());
     app.set_stash_scroll(off);
-    let list = List::new(stash_list_items(entries, theme))
-        .block(panel_block(
-            focused,
-            theme,
-            format!("[4]-Stash ({} of {})", sel + 1, entries.len()),
-        ))
-        .highlight_style(selection_style(theme))
-        .highlight_symbol("> ");
+    // Slice to the scrolled window (like the files panel) so the list
+    // scrolls instead of pinning the highlight to the wrong row.
+    let list = List::new(
+        stash_list_items(entries, theme)
+            .into_iter()
+            .skip(off)
+            .take(visible)
+            .collect::<Vec<_>>(),
+    )
+    .block(panel_block(
+        focused,
+        theme,
+        format!("[4]-Stash ({} of {})", sel + 1, entries.len()),
+    ))
+    .highlight_style(selection_style(theme))
+    .highlight_symbol("> ");
     let mut state = ListState::default();
     state.select((visible > 0).then(|| sel.saturating_sub(off)));
     frame.render_stateful_widget(list, area, &mut state);
@@ -3522,6 +3875,101 @@ mod tests {
         assert_eq!(d.diff.x, 30);
     }
 
+    fn rail_heights(l: &ScreenLayout) -> [u16; 5] {
+        [
+            l.status.height,
+            l.files.height,
+            l.branches.height,
+            l.commits.height,
+            l.stash.height,
+        ]
+    }
+
+    #[test]
+    fn focused_rail_panel_grows_and_siblings_shrink() {
+        let area = Rect::new(0, 0, 100, 32);
+        let base = compute_layout(area, 2, LayoutOverrides::default());
+        let focused = compute_layout_focused(area, 2, LayoutOverrides::default(), Focus::Branches);
+        assert!(
+            focused.branches.height > base.branches.height,
+            "focused branches must grow: base={} focused={}",
+            base.branches.height,
+            focused.branches.height
+        );
+        assert!(
+            focused.files.height < base.files.height,
+            "room must come from the roomiest sibling: base={} focused={}",
+            base.files.height,
+            focused.files.height
+        );
+        // Rail stays seamless: panels tile the body with no gaps.
+        let total: u16 = rail_heights(&focused).iter().sum();
+        assert_eq!(total, 30, "panels must tile the 30-row body");
+        // Nobody collapses below the drag minimum.
+        for h in rail_heights(&focused) {
+            assert!(h >= MIN_PANEL_H, "panel collapsed to {h}");
+        }
+    }
+
+    #[test]
+    fn focused_commits_and_stash_grow() {
+        let area = Rect::new(0, 0, 100, 32);
+        let base = compute_layout(area, 2, LayoutOverrides::default());
+        let log = compute_layout_focused(area, 2, LayoutOverrides::default(), Focus::Log);
+        assert!(
+            log.commits.height > base.commits.height,
+            "focused commits must grow: base={} focused={}",
+            base.commits.height,
+            log.commits.height
+        );
+        let stash = compute_layout_focused(area, 2, LayoutOverrides::default(), Focus::Stash);
+        assert!(
+            stash.stash.height > base.stash.height,
+            "focused stash must grow: base={} focused={}",
+            base.stash.height,
+            stash.stash.height
+        );
+        for l in [&log, &stash] {
+            let total: u16 = rail_heights(l).iter().sum();
+            assert_eq!(total, 30, "panels must tile the 30-row body");
+        }
+    }
+
+    #[test]
+    fn focused_diff_widens_preview() {
+        let area = Rect::new(0, 0, 100, 32);
+        let base = compute_layout(area, 2, LayoutOverrides::default());
+        let focused = compute_layout_focused(area, 2, LayoutOverrides::default(), Focus::Diff);
+        assert!(
+            focused.diff.width > base.diff.width,
+            "focused diff must widen: base={} focused={}",
+            base.diff.width,
+            focused.diff.width
+        );
+        assert!(
+            focused.diff.x < base.diff.x,
+            "rail must narrow for the preview: base={} focused={}",
+            base.diff.x,
+            focused.diff.x
+        );
+    }
+
+    #[test]
+    fn focused_layout_tiles_small_screens_without_panic() {
+        let area = Rect::new(0, 0, 60, 10);
+        for focus in [
+            Focus::Status,
+            Focus::Branches,
+            Focus::Log,
+            Focus::Stash,
+            Focus::Diff,
+        ] {
+            let l = compute_layout_focused(area, 2, LayoutOverrides::default(), focus);
+            let total: u16 = rail_heights(&l).iter().sum();
+            assert_eq!(total, 8, "panels must tile the 8-row body");
+        }
+    }
+
     #[test]
     fn divider_geometry_matches_layout() {
         let l = compute_layout(Rect::new(0, 0, 100, 32), 2, LayoutOverrides::default());
@@ -3565,6 +4013,80 @@ mod tests {
         assert!(
             s.contains("[Stage hunk]"),
             "fullscreen must show clickable buttons:\n{s}"
+        );
+    }
+
+    #[test]
+    fn long_branch_list_scrolls_with_selection() {
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        app.set_branches_for_test(
+            (0..10)
+                .map(|i| BranchInfo {
+                    name: format!("feat-{i}"),
+                    is_head: i == 0,
+                    tip_summary: "x".into(),
+                })
+                .collect(),
+        );
+        app.set_branch_selected_for_test(9);
+        let buf = render_buf(&app, 100, 28);
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(
+            text.contains("feat-9"),
+            "selected branch must scroll into view"
+        );
+        assert!(
+            !text.contains("feat-0"),
+            "top of the list must scroll out of view:\n{text}"
+        );
+        // The highlight sits on the selected row, not a pinned wrong row.
+        let theme = Theme::default_theme();
+        let mut highlighted = false;
+        for y in 0..buf.area.height {
+            let line: String = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            if line.contains("feat-9") && buf[(1, y)].bg == theme.selection_bg {
+                highlighted = true;
+            }
+        }
+        assert!(highlighted, "feat-9 row must carry the selection wash");
+    }
+
+    #[test]
+    fn long_stash_list_scrolls_with_selection() {
+        use git_tui_core::stash::StashEntry;
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        app.set_stash_for_test(
+            (0..10)
+                .map(|i| StashEntry {
+                    index: i,
+                    message: format!("wip-{i}"),
+                })
+                .collect(),
+        );
+        app.set_stash_selected_for_test(9);
+        let buf = render_buf(&app, 100, 28);
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(
+            text.contains("wip-9"),
+            "selected stash must scroll into view"
+        );
+        assert!(
+            !text.contains("wip-0"),
+            "top of the list must scroll out:\n{text}"
         );
     }
 
@@ -4781,13 +5303,21 @@ mod tests {
         app.set_log_for_test(vec![
             CommitInfo {
                 id: "abc1234".into(),
+                oid: "abc1234full".into(),
                 summary: "second".into(),
                 author: "Test User".into(),
+                parents: vec!["def5678full".into()],
+                refs: vec!["HEAD -> main".into()],
+                pushed: true,
             },
             CommitInfo {
                 id: "def5678".into(),
+                oid: "def5678full".into(),
                 summary: "init".into(),
                 author: "Test User".into(),
+                parents: vec![],
+                refs: vec![],
+                pushed: true,
             },
         ]);
         (dir, app)
@@ -4798,13 +5328,254 @@ mod tests {
         use crossterm::event::KeyCode;
         let (_dir, mut app) = with_log();
         app.on_key(KeyCode::Char('3'));
-        let s = screen(&app, 100, 32);
+        // Wide frame: the 44-col rail fits the whole decorated line.
+        let s = screen(&app, 150, 32);
         assert!(s.contains("Commits"), "pane title missing:\n{s}");
         assert!(s.contains("second"), "entry missing:\n{s}");
         assert!(s.contains("abc1234"), "short id missing:\n{s}");
         let newest = s.find("abc1234").unwrap();
         let older = s.find("def5678").unwrap();
         assert!(newest < older, "newest must come first:\n{s}");
+    }
+
+    /// Whether the row containing `needle` carries the selection wash
+    /// (same scan pattern as `long_branch_list_scrolls_with_selection`).
+    fn row_with_text_is_highlighted(buf: &ratatui::buffer::Buffer, theme: Theme, needle: &str) -> bool {
+        for y in 0..buf.area.height {
+            let line: String = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            if line.contains(needle) && buf[(1, y)].bg == theme.selection_bg {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn j_moves_the_commit_highlight_and_updates_the_count_label() {
+        use crossterm::event::KeyCode;
+        let (_dir, mut app) = with_log();
+        app.on_key(KeyCode::Char('3'));
+        let s = screen(&app, 150, 32);
+        assert!(s.contains("(1 of 2)"), "count label missing:\n{s}");
+        let theme = Theme::default_theme();
+        let buf = render_buf(&app, 150, 32);
+        assert!(
+            row_with_text_is_highlighted(&buf, theme, "second"),
+            "newest commit must carry the selection wash before any move"
+        );
+        app.on_key(KeyCode::Char('j'));
+        let s = screen(&app, 150, 32);
+        assert!(s.contains("(2 of 2)"), "count label must follow j:\n{s}");
+        let buf = render_buf(&app, 150, 32);
+        assert!(
+            row_with_text_is_highlighted(&buf, theme, "init"),
+            "older commit must carry the wash after j"
+        );
+        assert!(
+            !row_with_text_is_highlighted(&buf, theme, "second"),
+            "newest commit must drop the wash after j"
+        );
+    }
+
+    #[test]
+    fn commit_overview_panel_shows_message_author_and_file_stat() {
+        use crossterm::event::KeyCode;
+        use git_tui_core::log::{CommitFileStat, CommitOverview};
+        let (_dir, mut app) = with_log();
+        app.on_key(KeyCode::Char('3'));
+        assert_eq!(app.focus(), Focus::Log);
+        app.set_commit_overview_for_test(CommitOverview {
+            id: "abc1234".into(),
+            oid: "abc1234full".into(),
+            author: "Test User".into(),
+            email: "test@example.com".into(),
+            date: "2024-01-01 00:00:00 +0000".into(),
+            summary: "second".into(),
+            body: "more detail".into(),
+            parents: 1,
+            files: vec![CommitFileStat {
+                path: "a.txt".into(),
+                insertions: 2,
+                deletions: 1,
+                status: 'M',
+            }],
+            insertions: 2,
+            deletions: 1,
+        });
+        let s = screen(&app, 150, 32);
+        assert!(s.contains("Commit abc1234"), "panel title missing:\n{s}");
+        assert!(s.contains("Test User"), "author missing:\n{s}");
+        assert!(s.contains("test@example.com"), "email missing:\n{s}");
+        assert!(s.contains("more detail"), "body missing:\n{s}");
+        assert!(s.contains("a.txt"), "changed file missing:\n{s}");
+        assert!(
+            s.contains("1 file changed, +2 -1"),
+            "file stat summary missing:\n{s}"
+        );
+    }
+
+    #[test]
+    fn log_graph_renders_lanes_and_refs() {
+        use crossterm::event::KeyCode;
+        use git_tui_core::log::CommitInfo;
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        let entries = vec![
+            CommitInfo {
+                id: "merge12".into(),
+                oid: "merge-full".into(),
+                summary: "merge side".into(),
+                author: "Test User".into(),
+                parents: vec!["main-full".into(), "side-full".into()],
+                refs: vec!["HEAD -> main".into()],
+                pushed: true,
+            },
+            CommitInfo {
+                id: "main000".into(),
+                oid: "main-full".into(),
+                summary: "main work".into(),
+                author: "Test User".into(),
+                parents: vec!["base-full".into()],
+                refs: vec![],
+                pushed: true,
+            },
+            CommitInfo {
+                id: "side000".into(),
+                oid: "side-full".into(),
+                summary: "side work".into(),
+                author: "Test User".into(),
+                parents: vec!["base-full".into()],
+                refs: vec!["side".into()],
+                pushed: true,
+            },
+        ];
+        // Full text (no panel clipping): every marker present.
+        let theme = crate::config::Theme::default_theme();
+        let full: String = super::log_lines(&entries, theme)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(full.contains("●"), "graph node missing:\n{full}");
+        assert!(full.contains("─"), "merge join missing:\n{full}");
+        assert!(full.contains("│"), "fork rail missing:\n{full}");
+        assert!(full.contains("HEAD -> main"), "HEAD label missing:\n{full}");
+        assert!(full.contains("side"), "branch label missing:\n{full}");
+        // Reflog columns: author initials ride next to the id.
+        assert!(full.contains("TU"), "author initials missing:\n{full}");
+        // Lanes carry distinct colors: the fork rail's fg must differ
+        // from the commit node's fg on the two-lane row.
+        let lines = super::log_lines(&entries, theme);
+        let forked = &lines[1];
+        let node_fg = forked
+            .spans
+            .iter()
+            .find(|s| s.content == "●")
+            .map(|s| s.style.fg)
+            .unwrap();
+        let rail_fg = forked
+            .spans
+            .iter()
+            .find(|s| s.content == "│")
+            .map(|s| s.style.fg)
+            .unwrap();
+        assert_ne!(node_fg, rail_fg, "lanes must differ in color");
+        app.set_log_for_test(entries);
+        app.on_key(KeyCode::Char('3'));
+        let s = screen(&app, 150, 32);
+        assert!(s.contains("●"), "graph node missing:\n{s}");
+        assert!(s.contains("─"), "merge join missing:\n{s}");
+        assert!(s.contains("│"), "fork rail missing:\n{s}");
+        assert!(s.contains("HEAD -> main"), "HEAD label missing:\n{s}");
+    }
+
+    #[test]
+    fn log_graph_marks_unpushed_with_open_dot() {
+        use git_tui_core::log::CommitInfo;
+        let theme = crate::config::Theme::default_theme();
+        let entries = vec![
+            CommitInfo {
+                id: "abc1234".into(),
+                oid: "abc-full".into(),
+                summary: "local work".into(),
+                author: "Test User".into(),
+                parents: vec!["def-full".into()],
+                refs: vec!["HEAD -> main".into()],
+                pushed: false,
+            },
+            CommitInfo {
+                id: "def5678".into(),
+                oid: "def-full".into(),
+                summary: "init".into(),
+                author: "Test User".into(),
+                parents: vec![],
+                refs: vec![],
+                pushed: true,
+            },
+        ];
+        let full: String = super::log_lines(&entries, theme)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(full.contains("○"), "unpushed open dot missing:\n{full}");
+        assert!(full.contains("●"), "pushed filled dot missing:\n{full}");
+        let lines = super::log_lines(&entries, theme);
+        let top: String = lines[0].spans.iter().map(|s| s.content.clone()).collect();
+        let bottom: String = lines[1].spans.iter().map(|s| s.content.clone()).collect();
+        assert!(top.contains("○"), "top (unpushed) must be open:\n{top}");
+        assert!(
+            !top.contains("●"),
+            "top (unpushed) must not be filled:\n{top}"
+        );
+        assert!(
+            bottom.contains("●"),
+            "bottom (pushed) must be filled:\n{bottom}"
+        );
+    }
+
+    #[test]
+    fn log_graph_renders_tags_bare_and_initials() {
+        use git_tui_core::log::CommitInfo;
+        let theme = crate::config::Theme::default_theme();
+        let entries = vec![CommitInfo {
+            id: "d089546".into(),
+            oid: "d089546full".into(),
+            summary: "chore(release): bump version to 0.2.2".into(),
+            author: "Vasani Devarsh".into(),
+            parents: vec!["prev-full".into()],
+            refs: vec!["HEAD -> main".into(), "tag: v0.2.2".into()],
+            pushed: true,
+        }];
+        let full: String = super::log_lines(&entries, theme)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(full.contains("VD"), "initials missing:\n{full}");
+        assert!(full.contains("v0.2.2"), "tag missing:\n{full}");
+        assert!(
+            !full.contains("tag: v0.2.2"),
+            "tag prefix must be bare:\n{full}"
+        );
+        assert_eq!(super::author_initials("Test User"), "TU");
+        assert_eq!(super::author_initials("Aayush"), "AA");
     }
 
     fn with_stash() -> (tempfile::TempDir, App) {

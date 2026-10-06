@@ -7,7 +7,7 @@
 use crate::branch::BranchInfo;
 use crate::diff::FileDiff;
 use crate::error::GitError;
-use crate::log::CommitInfo;
+use crate::log::{CommitInfo, CommitOverview};
 use crate::repo::Repo;
 use crate::stash::StashEntry;
 use crate::status::RepoStatus;
@@ -69,6 +69,11 @@ pub enum AsyncJob {
     ListLog {
         limit: usize,
     },
+    /// Full detail for one commit (message, author, `--stat` file list),
+    /// for the commit overview panel.
+    LoadCommitOverview {
+        oid: String,
+    },
     ListStash,
     StashPush {
         message: String,
@@ -126,6 +131,7 @@ pub enum AsyncResult {
     },
     Branches(Vec<BranchInfo>),
     Log(Vec<CommitInfo>),
+    CommitOverview(CommitOverview),
     Stash(Vec<StashEntry>),
     SyncStatus(SyncStatus),
     /// LLM-generated commit message draft (commit box fills `draft`).
@@ -277,6 +283,10 @@ fn execute(repo: &mut Repo, job: AsyncJob) -> AsyncResult {
         },
         AsyncJob::ListLog { limit } => match repo.log(limit) {
             Ok(entries) => AsyncResult::Log(entries),
+            Err(e) => AsyncResult::Error(e),
+        },
+        AsyncJob::LoadCommitOverview { oid } => match repo.commit_overview(&oid) {
+            Ok(overview) => AsyncResult::CommitOverview(overview),
             Err(e) => AsyncResult::Error(e),
         },
         AsyncJob::ListStash => match repo.list_stash() {
