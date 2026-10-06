@@ -3444,7 +3444,9 @@ fn render_commit_overview_panel(frame: &mut Frame, area: Rect, app: &App) {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("  {} ", file.status),
-                    Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(status_color)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(file.path.clone()),
                 Span::raw("  "),
@@ -5340,7 +5342,11 @@ mod tests {
 
     /// Whether the row containing `needle` carries the selection wash
     /// (same scan pattern as `long_branch_list_scrolls_with_selection`).
-    fn row_with_text_is_highlighted(buf: &ratatui::buffer::Buffer, theme: Theme, needle: &str) -> bool {
+    fn row_with_text_is_highlighted(
+        buf: &ratatui::buffer::Buffer,
+        theme: Theme,
+        needle: &str,
+    ) -> bool {
         for y in 0..buf.area.height {
             let line: String = (0..buf.area.width)
                 .map(|x| buf[(x, y)].symbol().to_string())

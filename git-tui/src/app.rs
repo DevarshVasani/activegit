@@ -2979,7 +2979,10 @@ impl App {
         }
         self.commit_overview_for = Some(commit.oid.clone());
         self.commit_overview = None;
-        if let Err(e) = self.queue.submit(AsyncJob::LoadCommitOverview { oid: commit.oid }) {
+        if let Err(e) = self
+            .queue
+            .submit(AsyncJob::LoadCommitOverview { oid: commit.oid })
+        {
             self.error = Some(e.to_string());
         }
     }
@@ -6387,10 +6390,7 @@ mod tests {
         assert_eq!(fx.app.log_selected(), 0, "must clamp at the newest commit");
     }
 
-    fn wait_for_commit_overview(
-        app: &mut App,
-        oid: &str,
-    ) -> git_tui_core::log::CommitOverview {
+    fn wait_for_commit_overview(app: &mut App, oid: &str) -> git_tui_core::log::CommitOverview {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             app.poll();

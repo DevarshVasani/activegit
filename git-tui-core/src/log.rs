@@ -366,7 +366,11 @@ fn format_commit_time(time: git2::Time) -> String {
     let ss = secs_of_day % 60;
     let sign = if offset_min >= 0 { '+' } else { '-' };
     let off = offset_min.unsigned_abs();
-    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02} {sign}{:02}{:02}", off / 60, off % 60)
+    format!(
+        "{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02} {sign}{:02}{:02}",
+        off / 60,
+        off % 60
+    )
 }
 
 /// Days-since-epoch to a proleptic Gregorian (year, month, day), per
