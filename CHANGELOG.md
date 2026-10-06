@@ -3,6 +3,27 @@
 All notable changes to ActiveGit are documented here. Release notes are
 built from these entries by cargo-dist.
 
+## v0.2.3 - 2026-10-06
+
+### Commits panel
+
+- **Branch-graph rendering**: the `[3]-Commits` panel now draws a
+  `git log --graph` style lane view with per-branch colors, author
+  initials, merge joins, and bare tag names.
+- **Push-state dots**: each commit's dot is filled (`●`) when the commit
+  exists on the remote and open (`○`) while it is still local-only
+  (yet to push) — shared ancestors on untracked branches stay filled.
+- **Commit overview**: focusing the Commits panel shows the selected
+  commit's message, author, date, and per-file change stats in the
+  `[5]-Commit` panel.
+
+### Layout
+
+- **Focused section auto-expands**: the panel you are in automatically
+  grows (rail panels gain rows from roomier siblings, the diff preview
+  gains columns), so the active section always has the most room.
+  Divider drags still apply first — focus only redistributes the rest.
+
 ## v0.2.2 - 2026-10-04
 
 ### Diff workflow
