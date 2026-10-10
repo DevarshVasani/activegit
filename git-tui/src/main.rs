@@ -178,7 +178,7 @@ struct Cli {
 }
 
 const USAGE: &str =
-    "usage: activegit [--theme <default|tokyo-night|catppuccin|legacy>] [--no-welcome] [--repo <path>]... [<path>...] [-- <path>...]";
+    "usage: activegit [--theme <name>] [--no-welcome] [--repo <path>]... [<path>...] [-- <path>...]";
 
 fn parse_args(args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Cli> {
     let mut cli = Cli {
@@ -193,6 +193,8 @@ fn parse_args(args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Cli
             break;
         } else if arg == "-h" || arg == "--help" {
             println!("{USAGE}");
+            let themes: Vec<_> = Theme::names().collect();
+            println!("themes: {}", themes.join(", "));
             std::process::exit(0);
         } else if arg == "-V" || arg == "--version" {
             println!("activegit {}", env!("CARGO_PKG_VERSION"));

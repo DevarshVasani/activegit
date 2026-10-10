@@ -59,7 +59,7 @@ credential helpers keep working unchanged.
 </td>
 <td width="50%" valign="top">
 <img src="docs/screenshots/theme-tokyo-night.png" alt="The same main view in the Tokyo Night theme">
-<p align="center"><b>Themes</b><br><sub>Catppuccin Mocha (default), Tokyo Night, and a 16-color <code>legacy</code> palette. Every key is rebindable.</sub></p>
+<p align="center"><b>Themes</b><br><sub>Catppuccin Mocha (default), Tokyo Night, Gruvbox, Dracula, Nord and more, including light themes. Every key is rebindable.</sub></p>
 </td>
 </tr>
 </table>
@@ -165,7 +165,7 @@ activegit --version
 ```
 
 ```text
-usage: activegit [--theme <default|tokyo-night|catppuccin|legacy>]
+usage: activegit [--theme <name>] [--no-welcome]
                 [--repo <path>]... [<path>...] [-- <path>...]
 ```
 
@@ -259,7 +259,7 @@ unknown actions, keys, or sections fail fast and name the offending value.
 
 ```toml
 [theme]
-name = "tokyo-night"       # default | tokyo-night | catppuccin | legacy
+name = "tokyo-night"       # see Themes below
 
 [keys]
 stage = "s"
@@ -272,6 +272,17 @@ model = "claude-sonnet-5"
 api_key = ""               # empty = read from the provider's env var
 # base_url = "http://localhost:11434/v1"   # for provider = "custom" (or to override)
 ```
+
+### Themes
+
+Set `[theme] name` in the config, or pass `--theme <name>` for one run
+(`activegit --help` lists them too).
+
+| Kind  | Names |
+| ----- | ----- |
+| Dark  | `default` (= `catppuccin`, Mocha), `tokyo-night`, `gruvbox`, `dracula`, `nord`, `one-dark`, `kanagawa`, `everforest`, `solarized-dark`, `github-dark` |
+| Light | `one-light`, `gruvbox-light`, `github-light` |
+| ANSI  | `legacy` (16 colors, for terminals without truecolor) |
 
 > [!TIP]
 > **AI commits:** stage with `space`, open the commit box with `c`, then press

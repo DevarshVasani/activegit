@@ -302,18 +302,164 @@ impl Theme {
         }
     }
 
+    /// Every accepted `[theme] name` / `--theme` value, in display order.
+    pub fn names() -> impl Iterator<Item = &'static str> {
+        ["default", "tokyo-night", "catppuccin", "legacy"]
+            .into_iter()
+            .chain(PALETTES.iter().map(|(name, _)| *name))
+    }
+
     pub fn by_name(name: &str) -> Result<Self> {
         match name {
             "default" => Ok(Self::default_theme()),
             "tokyo-night" => Ok(Self::tokyo_night()),
             "catppuccin" => Ok(Self::catppuccin()),
             "legacy" => Ok(Self::legacy()),
-            _ => anyhow::bail!(
-                "unknown theme {name:?} (expected \"default\", \"tokyo-night\", \"catppuccin\", or \"legacy\")"
-            ),
+            _ => match PALETTES.iter().find(|(n, _)| *n == name) {
+                Some((_, palette)) => Ok(palette.theme()),
+                None => anyhow::bail!(
+                    "unknown theme {name:?} (expected one of: {})",
+                    Self::names().collect::<Vec<_>>().join(", ")
+                ),
+            },
         }
     }
 }
+
+/// A theme reduced to its base colors (`0xRRGGBB`); [`Palette::theme`]
+/// assigns them to UI roles the same way the hand-written themes do.
+struct Palette {
+    bg: u32,
+    fg: u32,
+    /// Comments, hints, untracked files.
+    dim: u32,
+    /// Unfocused borders and line numbers.
+    surface: u32,
+    selection: u32,
+    red: u32,
+    green: u32,
+    yellow: u32,
+    blue: u32,
+    magenta: u32,
+    cyan: u32,
+    orange: u32,
+}
+
+impl Palette {
+    fn theme(&self) -> Theme {
+        let c = |hex: u32| Color::Rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8);
+        // Diff washes are the accent blended into the background. Light
+        // backgrounds take less tint before text on top gets hard to read.
+        let light = (self.bg >> 8) & 0xff > 0x80;
+        let (del, add, del_word) = if light { (10, 10, 15) } else { (15, 12, 25) };
+        let wash = |accent: u32, percent: u32| {
+            let mix = |shift: u32| {
+                let (a, b) = ((accent >> shift) & 0xff, (self.bg >> shift) & 0xff);
+                ((a * percent + b * (100 - percent)) / 100) as u8
+            };
+            Color::Rgb(mix(16), mix(8), mix(0))
+        };
+        Theme {
+            border_focused: c(self.blue),
+            border_unfocused: c(self.surface),
+            hint: c(self.dim),
+            error: c(self.red),
+            staged: c(self.green),
+            unstaged: c(self.yellow),
+            untracked: c(self.dim),
+            conflicted: c(self.red),
+            both_staged: c(self.magenta),
+            hunk_header: c(self.cyan),
+            commit_id: c(self.orange),
+            branch_current: c(self.green),
+            context: c(self.dim),
+            diff_del_bg: wash(self.red, del),
+            diff_add_bg: wash(self.green, add),
+            diff_del_word_bg: wash(self.red, del_word),
+            bg: c(self.bg),
+            fg: c(self.fg),
+            line_nr: c(self.surface),
+            selection_bg: c(self.selection),
+            syntax_comment: c(self.dim),
+            syntax_string: c(self.green),
+            syntax_keyword: c(self.magenta),
+            syntax_function: c(self.blue),
+            syntax_type: c(self.cyan),
+            syntax_number: c(self.orange),
+        }
+    }
+}
+
+#[rustfmt::skip]
+const PALETTES: &[(&str, Palette)] = &[
+    // https://github.com/morhetz/gruvbox — dark, medium contrast.
+    ("gruvbox", Palette {
+        bg: 0x282828, fg: 0xebdbb2, dim: 0x928374, surface: 0x504945, selection: 0x3c3836,
+        red: 0xfb4934, green: 0xb8bb26, yellow: 0xfabd2f, blue: 0x83a598,
+        magenta: 0xd3869b, cyan: 0x8ec07c, orange: 0xfe8019,
+    }),
+    // https://draculatheme.com — purple stands in for blue.
+    ("dracula", Palette {
+        bg: 0x282a36, fg: 0xf8f8f2, dim: 0x6272a4, surface: 0x44475a, selection: 0x383a4c,
+        red: 0xff5555, green: 0x50fa7b, yellow: 0xf1fa8c, blue: 0xbd93f9,
+        magenta: 0xff79c6, cyan: 0x8be9fd, orange: 0xffb86c,
+    }),
+    // https://www.nordtheme.com
+    ("nord", Palette {
+        bg: 0x2e3440, fg: 0xd8dee9, dim: 0x616e88, surface: 0x4c566a, selection: 0x3b4252,
+        red: 0xbf616a, green: 0xa3be8c, yellow: 0xebcb8b, blue: 0x81a1c1,
+        magenta: 0xb48ead, cyan: 0x88c0d0, orange: 0xd08770,
+    }),
+    // Atom One Dark.
+    ("one-dark", Palette {
+        bg: 0x282c34, fg: 0xabb2bf, dim: 0x5c6370, surface: 0x3e4451, selection: 0x323842,
+        red: 0xe06c75, green: 0x98c379, yellow: 0xe5c07b, blue: 0x61afef,
+        magenta: 0xc678dd, cyan: 0x56b6c2, orange: 0xd19a66,
+    }),
+    // https://github.com/rebelot/kanagawa.nvim — Wave.
+    ("kanagawa", Palette {
+        bg: 0x1f1f28, fg: 0xdcd7ba, dim: 0x727169, surface: 0x54546d, selection: 0x223249,
+        red: 0xe46876, green: 0x98bb6c, yellow: 0xe6c384, blue: 0x7e9cd8,
+        magenta: 0x957fb8, cyan: 0x7fb4ca, orange: 0xffa066,
+    }),
+    // https://github.com/sainnhe/everforest — dark, medium contrast.
+    ("everforest", Palette {
+        bg: 0x2d353b, fg: 0xd3c6aa, dim: 0x859289, surface: 0x4f585e, selection: 0x3d484d,
+        red: 0xe67e80, green: 0xa7c080, yellow: 0xdbbc7f, blue: 0x7fbbb3,
+        magenta: 0xd699b6, cyan: 0x83c092, orange: 0xe69875,
+    }),
+    // https://ethanschoonover.com/solarized
+    ("solarized-dark", Palette {
+        bg: 0x002b36, fg: 0x93a1a1, dim: 0x586e75, surface: 0x245361, selection: 0x073642,
+        red: 0xdc322f, green: 0x859900, yellow: 0xb58900, blue: 0x268bd2,
+        magenta: 0xd33682, cyan: 0x2aa198, orange: 0xcb4b16,
+    }),
+    // GitHub Dark (Primer).
+    ("github-dark", Palette {
+        bg: 0x0d1117, fg: 0xe6edf3, dim: 0x8b949e, surface: 0x30363d, selection: 0x1c2b41,
+        red: 0xff7b72, green: 0x7ee787, yellow: 0xd29922, blue: 0x79c0ff,
+        magenta: 0xd2a8ff, cyan: 0xa5d6ff, orange: 0xffa657,
+    }),
+    // --- light ---
+    // Atom One Light.
+    ("one-light", Palette {
+        bg: 0xfafafa, fg: 0x383a42, dim: 0xa0a1a7, surface: 0xd0d0d2, selection: 0xe5e5e6,
+        red: 0xe45649, green: 0x50a14f, yellow: 0xc18401, blue: 0x4078f2,
+        magenta: 0xa626a4, cyan: 0x0184bc, orange: 0x986801,
+    }),
+    // https://github.com/morhetz/gruvbox — light, medium contrast.
+    ("gruvbox-light", Palette {
+        bg: 0xfbf1c7, fg: 0x3c3836, dim: 0x928374, surface: 0xd5c4a1, selection: 0xebdbb2,
+        red: 0x9d0006, green: 0x79740e, yellow: 0xb57614, blue: 0x076678,
+        magenta: 0x8f3f71, cyan: 0x427b58, orange: 0xaf3a03,
+    }),
+    // GitHub Light (Primer).
+    ("github-light", Palette {
+        bg: 0xffffff, fg: 0x1f2328, dim: 0x6e7781, surface: 0xd0d7de, selection: 0xeaeef2,
+        red: 0xcf222e, green: 0x1a7f37, yellow: 0x9a6700, blue: 0x0969da,
+        magenta: 0x8250df, cyan: 0x1b7c83, orange: 0xbc4c00,
+    }),
+];
 
 /// Resolved configuration.
 #[derive(Debug, Clone)]
@@ -626,7 +772,99 @@ mod tests {
         assert_eq!(Theme::by_name("legacy").unwrap().staged, Color::Green);
         let mocha = Theme::by_name("catppuccin").unwrap();
         assert_eq!(mocha, Theme::default_theme());
-        assert!(Theme::by_name("dracula").is_err());
+        assert!(Theme::by_name("no-such-theme").is_err());
+    }
+
+    #[test]
+    fn every_listed_theme_resolves_and_names_are_unique() {
+        let names: Vec<_> = Theme::names().collect();
+        for name in &names {
+            assert!(Theme::by_name(name).is_ok(), "{name} does not resolve");
+        }
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), names.len());
+        let err = Theme::by_name("nope").unwrap_err().to_string();
+        assert!(err.contains("gruvbox") && err.contains("github-light"));
+        assert_eq!(names.len(), 4 + PALETTES.len());
+    }
+
+    /// WCAG contrast ratio between two RGB colors (1.0 to 21.0).
+    fn contrast(a: Color, b: Color) -> f64 {
+        let lum = |c: Color| {
+            let Color::Rgb(r, g, b) = c else {
+                panic!("expected RGB, got {c:?}");
+            };
+            let lin = |v: u8| {
+                let v = f64::from(v) / 255.0;
+                if v <= 0.04045 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+        };
+        let (la, lb) = (lum(a), lum(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    #[test]
+    fn palette_themes_stay_readable() {
+        let mut problems = Vec::new();
+        let mut check = |name: &str, what: &str, fg: Color, bg: Color, min: f64| {
+            let ratio = contrast(fg, bg);
+            if ratio < min {
+                problems.push(format!(
+                    "{name}: {what} {fg:?} on {bg:?} is {ratio:.2} < {min}"
+                ));
+            }
+        };
+        for (name, palette) in PALETTES {
+            let t = palette.theme();
+            let washes = [t.diff_add_bg, t.diff_del_bg, t.diff_del_word_bg];
+            // Body text on every surface it is drawn on.
+            for bg in [t.bg, t.selection_bg].into_iter().chain(washes) {
+                check(name, "text", t.fg, bg, 4.5);
+            }
+            // Status colors live on the plain background and the selection.
+            let status = [
+                t.error,
+                t.staged,
+                t.unstaged,
+                t.both_staged,
+                t.hunk_header,
+                t.commit_id,
+                t.border_focused,
+            ];
+            for accent in status {
+                check(name, "status", accent, t.bg, 3.0);
+                check(name, "status", accent, t.selection_bg, 2.4);
+            }
+            // Syntax colors are also painted over the diff washes.
+            let syntax = [
+                t.syntax_string,
+                t.syntax_keyword,
+                t.syntax_function,
+                t.syntax_type,
+                t.syntax_number,
+            ];
+            for accent in syntax {
+                for bg in [t.bg].into_iter().chain(washes) {
+                    check(name, "syntax", accent, bg, 2.5);
+                }
+            }
+            // Dim text is quiet but must not vanish.
+            check(name, "dim", t.hint, t.bg, 2.3);
+            assert_ne!(t.selection_bg, t.bg, "{name}: selection is invisible");
+        }
+        assert!(
+            problems.is_empty(),
+            "{}",
+            problems.join(
+                "
+"
+            )
+        );
     }
 
     #[test]
