@@ -14,6 +14,7 @@ use crate::status::RepoStatus;
 use crate::sync::SyncStatus;
 use crossbeam_channel::{Receiver, Sender};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// Work requests. All data owned so it can cross threads.
@@ -160,6 +161,8 @@ pub enum AsyncResult {
 pub struct JobQueue {
     job_tx: Sender<AsyncJob>,
     result_rx: Receiver<AsyncResult>,
+    /// Jobs submitted whose result has not been received yet.
+    pending: AtomicUsize,
 }
 
 impl JobQueue {
@@ -174,31 +177,56 @@ impl JobQueue {
         let (job_tx, job_rx) = crossbeam_channel::unbounded::<AsyncJob>();
         let (result_tx, result_rx) = crossbeam_channel::unbounded::<AsyncResult>();
         std::thread::spawn(move || worker_loop(repo, job_rx, result_tx));
-        Self { job_tx, result_rx }
+        Self {
+            job_tx,
+            result_rx,
+            pending: AtomicUsize::new(0),
+        }
     }
 
     /// Submit a job without blocking. Errors only if the worker is gone.
     pub fn submit(&self, job: AsyncJob) -> Result<(), GitError> {
         self.job_tx
             .send(job)
-            .map_err(|_| GitError::ChannelDisconnected)
+            .map_err(|_| GitError::ChannelDisconnected)?;
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Whether any submitted job is still waiting for its result. The
+    /// render loop polls faster while this is true so results show up as
+    /// soon as the worker finishes.
+    pub fn has_pending(&self) -> bool {
+        self.pending.load(Ordering::Relaxed) > 0
+    }
+
+    /// Every job yields exactly one result.
+    fn received(&self) {
+        self.pending.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Non-blocking drain for the render loop.
     pub fn try_recv(&self) -> Option<AsyncResult> {
-        self.result_rx.try_recv().ok()
+        let result = self.result_rx.try_recv().ok()?;
+        self.received();
+        Some(result)
     }
 
     /// Blocking receive (tests / simple drivers).
     pub fn recv(&self) -> Result<AsyncResult, GitError> {
-        self.result_rx
+        let result = self
+            .result_rx
             .recv()
-            .map_err(|_| GitError::ChannelDisconnected)
+            .map_err(|_| GitError::ChannelDisconnected)?;
+        self.received();
+        Ok(result)
     }
 
     /// Blocking receive with timeout (tests).
     pub fn recv_timeout(&self, timeout: Duration) -> Option<AsyncResult> {
-        self.result_rx.recv_timeout(timeout).ok()
+        let result = self.result_rx.recv_timeout(timeout).ok()?;
+        self.received();
+        Some(result)
     }
 }
 
@@ -397,6 +425,21 @@ mod tests {
         let st = expect_status(recv_next(&queue));
         assert_eq!(st.branch, "main");
         assert!(st.files.iter().any(|e| e.path == "a.txt"));
+    }
+
+    #[test]
+    fn has_pending_tracks_jobs_until_their_result_is_received() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "one\n", "init");
+        let queue = JobQueue::spawn_from_repo(Repo::from_inner(repo));
+        assert!(!queue.has_pending());
+        queue.submit(AsyncJob::RefreshStatus).unwrap();
+        queue.submit(AsyncJob::RefreshStatus).unwrap();
+        assert!(queue.has_pending());
+        recv_next(&queue);
+        assert!(queue.has_pending());
+        recv_next(&queue);
+        assert!(!queue.has_pending());
     }
 
     #[test]

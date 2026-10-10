@@ -664,10 +664,19 @@ impl Workspace {
         }
     }
 
-    pub fn poll(&mut self) {
+    /// Drain every project's finished jobs; returns whether any landed
+    /// (the screen then needs a repaint).
+    pub fn poll(&mut self) -> bool {
+        let mut changed = false;
         for app in &mut self.apps {
-            app.poll();
+            changed |= app.poll();
         }
+        changed
+    }
+
+    /// Whether any project still waits on its worker.
+    pub fn busy(&self) -> bool {
+        self.apps.iter().any(App::busy)
     }
 
     pub fn request_quit(&mut self) {

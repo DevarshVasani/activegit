@@ -26,7 +26,7 @@ use session::Session;
 use std::ffi::OsString;
 use std::io::stdout;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use workspace::Workspace;
 
 fn main() -> Result<()> {
@@ -228,70 +228,98 @@ fn parse_args(args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Cli
     Ok(cli)
 }
 
+/// How long to wait for input when nothing is happening.
+const IDLE_TICK: Duration = Duration::from_millis(100);
+/// How long to wait for input while the worker still owes a result, so the
+/// result is drawn as soon as it lands instead of up to a full idle tick
+/// later (a stage is three chained jobs: mutate, status, diff).
+const BUSY_TICK: Duration = Duration::from_millis(8);
+
 /// Event loop, exactly: input → dispatch → poll → render.
 /// Polling (not blocking) on input keeps status refreshes and the render
 /// loop live; draining the job queue never blocks either.
 ///
 /// Stage 5 — the render-loop pattern: unlike a request/response CLI (run
 /// once, print, exit), a TUI loops forever: `poll` input with a timeout
-/// (here 100ms so a frame still renders with no input) → update state →
-/// `draw` the whole screen → repeat. `draw` diffs the previous frame and
-/// emits only the changed ANSI sequences.
+/// (so a frame still renders with no input) → update state → `draw` the
+/// whole screen → repeat. `draw` diffs the previous frame and emits only
+/// the changed ANSI sequences.
 fn run(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     workspace: &mut Workspace,
 ) -> Result<()> {
     let mut welcome_was_visible = workspace.welcome_visible();
+    let mut last_draw: Option<Instant> = None;
     loop {
-        if event::poll(Duration::from_millis(100)).context("cannot poll input")? {
-            match event::read().context("cannot read input")? {
-                Event::Key(key) => {
-                    if key.kind != KeyEventKind::Press {
-                        continue;
-                    }
-                    // Ctrl-C safety hatch: works even if the user rebinds `quit`
-                    // away from `q`, and in text modals where `q` is literal.
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(key.code, KeyCode::Char('c' | 'C'))
-                    {
-                        workspace.request_quit();
-                    } else {
-                        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-                        workspace.on_key_with_modifiers(
-                            normalize_key(key.code, key.modifiers),
-                            // `normalize_key` folds Shift+a into `A`; the commit
-                            // box needs the original Shift state so a literal
-                            // `A` (caps lock) still types normally.
-                            shift
-                                || matches!(
-                                    normalize_key(key.code, key.modifiers),
-                                    KeyCode::Char('A')
-                                ),
-                        );
-                    }
+        let tick = if workspace.busy() {
+            BUSY_TICK
+        } else {
+            IDLE_TICK
+        };
+        let mut redraw = false;
+        if event::poll(tick).context("cannot poll input")? {
+            // Drain everything already queued before drawing: a held key
+            // then costs one frame per batch, not one frame per repeat.
+            loop {
+                redraw |= handle_event(event::read().context("cannot read input")?, workspace);
+                if !event::poll(Duration::ZERO).context("cannot poll input")? {
+                    break;
                 }
-                Event::Mouse(m) => {
-                    if let Some(action) = map_mouse(m.kind, m.column, m.row) {
-                        workspace.on_mouse(action);
-                    }
-                }
-                Event::Resize(_, _) => {}
-                _ => {}
             }
         }
-        workspace.poll();
+        redraw |= workspace.poll();
         // Persist the welcome dismissal so the intro shows exactly once.
         if welcome_was_visible && !workspace.welcome_visible() {
             welcome::mark_welcome_seen();
         }
         welcome_was_visible = workspace.welcome_visible();
-        terminal
-            .draw(|f| ui::render_workspace(f, workspace))
-            .context("cannot render")?;
+        // Busy ticks are short; only repaint when something changed or the
+        // idle heartbeat is due.
+        if redraw || last_draw.is_none_or(|t| t.elapsed() >= IDLE_TICK) {
+            terminal
+                .draw(|f| ui::render_workspace(f, workspace))
+                .context("cannot render")?;
+            last_draw = Some(Instant::now());
+        }
         if workspace.should_quit() {
             return Ok(());
         }
     }
+}
+
+/// Apply one terminal event; returns whether the screen needs a repaint.
+/// Key releases (Windows reports one per keystroke) are ignored without
+/// stalling the loop.
+fn handle_event(event: Event, workspace: &mut Workspace) -> bool {
+    let key = match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => key,
+        Event::Key(_) => return false,
+        Event::Mouse(m) => {
+            // Plain pointer motion maps to nothing and needs no repaint.
+            return match map_mouse(m.kind, m.column, m.row) {
+                Some(action) => {
+                    workspace.on_mouse(action);
+                    true
+                }
+                None => false,
+            };
+        }
+        _ => return true,
+    };
+    // Ctrl-C safety hatch: works even if the user rebinds `quit`
+    // away from `q`, and in text modals where `q` is literal.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
+    {
+        workspace.request_quit();
+    } else {
+        let code = normalize_key(key.code, key.modifiers);
+        // `normalize_key` folds Shift+a into `A`; the commit box needs the
+        // original Shift state so a literal `A` (caps lock) still types
+        // normally.
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        workspace.on_key_with_modifiers(code, shift || matches!(code, KeyCode::Char('A')));
+    }
+    true
 }
 
 #[cfg(test)]

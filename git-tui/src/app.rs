@@ -3719,9 +3719,11 @@ impl App {
     /// frame). A [`AsyncResult::MutationDone`] invalidates the snapshot, so
     /// it refreshes status and reloads the focused diff rather than patching
     /// either incrementally.
-    pub fn poll(&mut self) {
+    pub fn poll(&mut self) -> bool {
+        let mut changed = false;
         while let Some(result) = self.queue.try_recv() {
             self.apply(result);
+            changed = true;
         }
         // After a mutation the [5] preview waits for the fresh status
         // (see `pending_diff_reload`): loading the old target now would
@@ -3731,6 +3733,12 @@ impl App {
             self.maybe_load_markdown();
         }
         self.maybe_load_commit_overview();
+        changed
+    }
+
+    /// Whether the worker still owes a result for a submitted job.
+    pub fn busy(&self) -> bool {
+        self.queue.has_pending()
     }
 
     fn apply(&mut self, result: AsyncResult) {
