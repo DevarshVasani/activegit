@@ -189,6 +189,7 @@ file for one run. With no paths, the last session's projects are reopened
 | `Shift+A`       | Generate AI commit message (in commit box)             |
 | `A`             | LLM setup form (in file list)                          |
 | `T`             | Theme picker (live preview, `enter` saves)             |
+| `?`             | Actions menu: every action, searchable, with its key   |
 | `/`             | Fuzzy-find a file (`enter` jumps to it)                |
 | `1`–`5`         | Focus Status+Files / Branches / Commits / Stash / Diff |
 | `tab`           | Cycle left-rail panels                                 |
@@ -222,6 +223,17 @@ file for one run. With no paths, the last session's projects are reopened
 Text boxes (commit, new branch, stash, finder, path prompt) support full
 cursor editing: `←`/`→`, `Home`/`End`, `backspace`/`Del`, and horizontal
 scroll for long lines.
+
+## Actions menu and mouse
+
+`?` (or the `[Menu]` button in the bottom bar) opens a list of every action
+for the focused panel, grouped, with its key shown on the right. Type to
+filter, `↑`/`↓` to move, `enter` to run, `esc` to close.
+
+Actions that throw work away (discard changes, restore hunk, delete branch,
+drop stash) are not on the clickable bottom bar, where a stray click would
+fire them. They are in the menu, marked in red, and ask for a second `enter`
+that names what will be affected. Their keys (`d`, `x`, `D`) work as before.
 
 ## Multiple projects
 
@@ -313,7 +325,7 @@ focus_status  focus_branches  focus_log  focus_stash  focus_diff
 scroll_up  scroll_down  branch_new  branch_delete  checkout
 stash_pop  stash_push  stash_drop  find_files
 project_next  project_prev  project_open  project_close
-sync_pull  sync_push  llm_settings  toggle_markdown_preview  theme_picker
+sync_pull  sync_push  llm_settings  toggle_markdown_preview  theme_picker  action_menu
 ```
 
 </details>

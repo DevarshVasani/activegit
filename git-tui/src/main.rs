@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod fuzzy;
 mod markdown;
+mod menu;
 mod session;
 mod syntax;
 mod ui;

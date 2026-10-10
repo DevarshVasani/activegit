@@ -3,6 +3,31 @@
 All notable changes to ActiveGit are documented here. Release notes are
 built from these entries by cargo-dist.
 
+## Unreleased
+
+### Actions menu
+
+- **`?` / `[Menu]`**: a searchable list of every action for the focused
+  panel, grouped, with each action's key. Type to filter, `enter` runs.
+- **Safer button bar**: actions that throw work away (discard, restore
+  hunk, delete branch, drop stash) left the clickable bottom bar. They
+  are in the menu and ask for a second `enter` naming the target. Their
+  keys are unchanged.
+
+### Themes
+
+- **11 new themes**: `gruvbox`, `dracula`, `nord`, `one-dark`, `kanagawa`,
+  `everforest`, `solarized-dark`, `github-dark`, and the light `one-light`,
+  `gruvbox-light`, `github-light`.
+- **Theme picker** (`T` / `[Theme]`): live preview while moving through
+  the list; `enter` saves `[theme] name` to the config.
+
+### Responsiveness
+
+- Results from background git work are drawn as soon as they land instead
+  of up to 100ms later (per step; staging chains three). On Windows a key
+  release no longer restarts that wait.
+
 ## v0.2.3 - 2026-10-06
 
 ### Commits panel
