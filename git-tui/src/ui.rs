@@ -303,6 +303,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::ConfirmInit => render_confirm_init_modal(frame, area, app),
         Mode::ConfirmPush => render_confirm_push_modal(frame, area, app),
         Mode::LlmSettings => render_llm_modal(frame, area, app),
+        Mode::ThemePicker => render_theme_modal(frame, area, app),
         Mode::FindFile => {
             // Opened fullscreen: keep the diff behind the modal.
             if app.finder_return() == Mode::FullDiff {
@@ -369,6 +370,7 @@ pub fn render_workspace(frame: &mut Frame, ws: &Workspace) {
         Mode::ConfirmInit => render_confirm_init_modal(frame, body, app),
         Mode::ConfirmPush => render_confirm_push_modal(frame, body, app),
         Mode::LlmSettings => render_llm_modal(frame, body, app),
+        Mode::ThemePicker => render_theme_modal(frame, body, app),
         Mode::FindFile => {
             if app.finder_return() == Mode::FullDiff {
                 render_fullscreen_diff(frame, body, app);
@@ -2255,6 +2257,7 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
         }
         Mode::FindFile => "type to filter · ↑/↓ move · ←/→ edit · enter open · esc cancel",
         Mode::LlmSettings => "tab/↑↓ switch field · ←/→ choose/edit · enter save · esc cancel",
+        Mode::ThemePicker => "↑/↓ preview · enter keep + save · esc cancel",
         Mode::OpenProject => {
             "type to filter · ↑/↓ move · enter open/descend · → descend · ← up · tab jump to path · esc clear/close"
         }
@@ -2302,6 +2305,7 @@ pub(crate) enum FooterAction {
     StashPop,
     StashPush,
     StashDrop,
+    Theme,
 }
 
 pub(crate) fn footer_buttons(app: &App) -> Vec<(&'static str, FooterAction)> {
@@ -2342,6 +2346,7 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<(&'static str, FooterAction)> {
             ("Push", Push),
             ("Find", Find),
             ("Diff", OpenDiff),
+            ("Theme", Theme),
         ],
         _ => vec![("Find", Find)],
     }
@@ -2492,6 +2497,42 @@ fn render_finder_modal(frame: &mut Frame, area: Rect, app: &App) {
     if cursor_x < popup.x + popup.width.saturating_sub(1) {
         frame.set_cursor_position((cursor_x, cursor_y));
     }
+}
+
+/// Theme picker (`T`): every theme name, with the highlighted one already
+/// applied to the whole screen behind the popup as a live preview.
+fn render_theme_modal(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme();
+    let names: Vec<&str> = Theme::names().collect();
+    let selected = app.theme_selected();
+    // The view the picker was opened from stays visible around the popup.
+    let popup = centered_rect(area, 34, names.len() as u16 + 2);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), popup);
+    let block = panel_block(true, theme, " Theme ".to_string());
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let rows = popup.height.saturating_sub(2) as usize;
+    // Window follows the selection when the terminal is too short.
+    let start = selected.saturating_sub(rows.saturating_sub(1));
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows);
+    let mut hit: Vec<(u16, usize)> = Vec::new();
+    for (row, name) in names.iter().enumerate().skip(start).take(rows) {
+        hit.push((popup.y + 1 + lines.len() as u16, row));
+        let style = if row == selected {
+            selection_style(theme)
+        } else {
+            Style::default().fg(theme.fg).bg(theme.bg)
+        };
+        let marker = if row == selected { "> " } else { "  " };
+        let pad = inner_w.saturating_sub(marker.len() + name.len());
+        lines.push(Line::from(vec![
+            Span::styled(marker.to_string(), style),
+            Span::styled(name.to_string(), style),
+            Span::styled(" ".repeat(pad), style),
+        ]));
+    }
+    app.set_hit(HitMap::ThemePicker, hit);
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 /// Commit modal title: shows the generating state while the LLM call is
@@ -5740,5 +5781,32 @@ mod tests {
         app.on_key(KeyCode::Char('w'));
         let s = screen(&app, 70, 12);
         assert!(s.contains("Stash message"), "modal title missing:\n{s}");
+    }
+
+    #[test]
+    fn theme_picker_lists_themes_and_recolors_the_screen() {
+        use crossterm::event::KeyCode;
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        let before = render_buf(&app, 100, 32);
+        app.on_key(KeyCode::Char('T'));
+        let s = screen(&app, 100, 32);
+        for name in Theme::names() {
+            assert!(
+                s.contains(name),
+                "{name} missing from the picker:
+{s}"
+            );
+        }
+        assert!(
+            s.contains("> default"),
+            "active theme not selected:
+{s}"
+        );
+        // Moving the selection repaints everything behind the popup too.
+        app.on_key(KeyCode::Down);
+        let after = render_buf(&app, 100, 32);
+        assert_eq!(before[(0, 0)].bg, Theme::default_theme().bg);
+        assert_eq!(after[(0, 0)].bg, Theme::by_name("tokyo-night").unwrap().bg);
+        assert!(screen(&app, 100, 32).contains("> tokyo-night"));
     }
 }

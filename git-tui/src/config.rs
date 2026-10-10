@@ -45,6 +45,7 @@ pub const ACTIONS: &[&str] = &[
     "sync_push",
     "llm_settings",
     "toggle_markdown_preview",
+    "theme_picker",
 ];
 
 /// Key names accepted in `[keys]` besides single characters.
@@ -106,6 +107,8 @@ pub struct KeyBindings {
     pub llm_settings: Vec<KeyCode>,
     /// Toggles rendered Markdown preview for `.md` files (`m`).
     pub toggle_markdown_preview: Vec<KeyCode>,
+    /// Opens the in-TUI theme picker (`T`).
+    pub theme_picker: Vec<KeyCode>,
 }
 
 impl Default for KeyBindings {
@@ -143,6 +146,7 @@ impl Default for KeyBindings {
             // Shift+A in the file list (Shift+a normalizes to `A`).
             llm_settings: vec![Char('A')],
             toggle_markdown_preview: vec![Char('m')],
+            theme_picker: vec![Char('T')],
         }
     }
 }
@@ -575,6 +579,29 @@ impl Config {
         Ok(())
     }
 
+    /// Persist `[theme] name` to `path`, keeping every other section of an
+    /// existing config intact (same approach as [`Self::save_llm_to_path`]).
+    pub fn save_theme_to_path(path: &Path, name: &str) -> Result<()> {
+        let mut doc: toml::Table = if path.exists() {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("cannot read config {}", path.display()))?;
+            toml::from_str(&text).with_context(|| format!("bad config {}", path.display()))?
+        } else {
+            toml::Table::new()
+        };
+        let mut table = toml::Table::new();
+        table.insert("name".to_string(), toml::Value::String(name.to_string()));
+        doc.insert("theme".to_string(), toml::Value::Table(table));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
+        let text = toml::to_string_pretty(&doc).context("cannot serialize config")?;
+        std::fs::write(path, text)
+            .with_context(|| format!("cannot write config {}", path.display()))?;
+        Ok(())
+    }
+
     fn from_toml(text: &str) -> Result<Self> {
         #[derive(Default, Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -660,6 +687,7 @@ impl Config {
                 "sync_push" => k.sync_push = keys,
                 "llm_settings" => k.llm_settings = keys,
                 "toggle_markdown_preview" => k.toggle_markdown_preview = keys,
+                "theme_picker" => k.theme_picker = keys,
                 _ => anyhow::bail!(
                     "unknown action [{action}] (expected one of: {})",
                     ACTIONS.join(", ")
@@ -773,6 +801,27 @@ mod tests {
         let mocha = Theme::by_name("catppuccin").unwrap();
         assert_eq!(mocha, Theme::default_theme());
         assert!(Theme::by_name("no-such-theme").is_err());
+    }
+
+    #[test]
+    fn save_theme_keeps_other_sections_and_round_trips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nested").join("config.toml");
+        // No file yet: created with just the theme.
+        Config::save_theme_to_path(&path, "nord").unwrap();
+        let cfg = Config::load_from_path(&path).unwrap();
+        assert_eq!(cfg.theme, Theme::by_name("nord").unwrap());
+        // Existing sections survive a theme change.
+        std::fs::write(
+            &path,
+            "[keys]\nquit = \"Q\"\n\n[theme]\nname = \"nord\"\n\n[llm]\nprovider = \"ollama\"\n",
+        )
+        .unwrap();
+        Config::save_theme_to_path(&path, "gruvbox").unwrap();
+        let cfg = Config::load_from_path(&path).unwrap();
+        assert_eq!(cfg.theme, Theme::by_name("gruvbox").unwrap());
+        assert_eq!(cfg.llm.provider, "ollama");
+        assert_eq!(cfg.keys.quit, vec![KeyCode::Char('Q')]);
     }
 
     #[test]

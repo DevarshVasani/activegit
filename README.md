@@ -188,6 +188,7 @@ file for one run. With no paths, the last session's projects are reopened
 | `c`             | Commit (`↑`/`↓` move between lines, `enter` commits)   |
 | `Shift+A`       | Generate AI commit message (in commit box)             |
 | `A`             | LLM setup form (in file list)                          |
+| `T`             | Theme picker (live preview, `enter` saves)             |
 | `/`             | Fuzzy-find a file (`enter` jumps to it)                |
 | `1`–`5`         | Focus Status+Files / Branches / Commits / Stash / Diff |
 | `tab`           | Cycle left-rail panels                                 |
@@ -275,8 +276,10 @@ api_key = ""               # empty = read from the provider's env var
 
 ### Themes
 
-Set `[theme] name` in the config, or pass `--theme <name>` for one run
-(`activegit --help` lists them too).
+Press `T` to pick a theme inside the app: moving through the list previews
+each one live, `enter` keeps it and saves it to the config, `esc` goes back.
+You can also set `[theme] name` in the config yourself, or pass
+`--theme <name>` for one run (`activegit --help` lists the names).
 
 | Kind  | Names |
 | ----- | ----- |
@@ -310,7 +313,7 @@ focus_status  focus_branches  focus_log  focus_stash  focus_diff
 scroll_up  scroll_down  branch_new  branch_delete  checkout
 stash_pop  stash_push  stash_drop  find_files
 project_next  project_prev  project_open  project_close
-sync_pull  sync_push  llm_settings  toggle_markdown_preview
+sync_pull  sync_push  llm_settings  toggle_markdown_preview  theme_picker
 ```
 
 </details>

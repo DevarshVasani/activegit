@@ -467,6 +467,7 @@ impl Workspace {
             MouseAction::ScrollUp(col, row) => self.current_mut().on_wheel(col, row, true),
             MouseAction::ScrollDown(col, row) => self.current_mut().on_wheel(col, row, false),
         }
+        self.sync_theme();
     }
 
     /// Click a project-browser row: select it, or activate it when it is
@@ -578,6 +579,20 @@ impl Workspace {
             }
         }
         self.current_mut().on_key_with_modifiers(key, shift_held);
+        self.sync_theme();
+    }
+
+    /// The theme picker runs inside one project tab but the theme is
+    /// global: copy the current tab's theme to every tab and to the config
+    /// that new tabs are opened with.
+    fn sync_theme(&mut self) {
+        let theme = self.current().theme();
+        if self.config.theme != theme {
+            self.config.theme = theme;
+            for app in &mut self.apps {
+                app.set_theme(theme);
+            }
+        }
     }
 
     /// Keys inside the project browser. Typing filters the current
@@ -1452,5 +1467,31 @@ mod tests {
         ws.on_key(KeyCode::Char('o'));
         assert!(!ws.welcome_visible());
         assert_eq!(ws.current().mode(), Mode::OpenProject);
+    }
+
+    #[test]
+    fn theme_picker_preview_applies_to_every_project_tab() {
+        let a = init_repo_with_file(
+            "a", "a.txt", "a
+",
+        );
+        let b = init_repo_with_file(
+            "b", "b.txt", "b
+",
+        );
+        let mut ws = Workspace::open(
+            vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            Config::default(),
+        )
+        .unwrap();
+        let before = ws.theme();
+        ws.on_key(KeyCode::Char('T'));
+        ws.on_key(KeyCode::Down);
+        let picked = ws.theme();
+        assert_ne!(picked, before);
+        assert!(ws.apps.iter().all(|app| app.theme() == picked));
+        // Esc restores every tab, not just the one showing the picker.
+        ws.on_key(KeyCode::Esc);
+        assert!(ws.apps.iter().all(|app| app.theme() == before));
     }
 }

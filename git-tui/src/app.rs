@@ -58,6 +58,9 @@ pub enum Mode {
     /// In-TUI LLM provider setup (`A` in the file list): provider, model,
     /// API key, and optional base URL. Enter saves to the config file.
     LlmSettings,
+    /// In-TUI theme picker (`T`): moving the selection previews the theme
+    /// live, Enter keeps it and saves `[theme]`, Esc restores the old one.
+    ThemePicker,
 }
 
 /// Which panel receives navigation keys. Everything is vertical: Tab cycles
@@ -251,6 +254,11 @@ pub struct App {
     full_hit: std::cell::RefCell<Vec<(u16, usize)>>,
     prev_hit: std::cell::RefCell<Vec<(u16, usize)>>,
     finder_hit: std::cell::RefCell<Vec<(u16, usize)>>,
+    theme_hit: std::cell::RefCell<Vec<(u16, usize)>>,
+    /// Theme picker: highlighted row (index into [`Theme::names`]) and the
+    /// theme to restore on Esc.
+    theme_selected: usize,
+    theme_before: Theme,
     browser_hit: std::cell::RefCell<Vec<(u16, usize)>>,
 }
 
@@ -270,6 +278,7 @@ pub(crate) enum HitMap {
     Preview,
     Finder,
     Browser,
+    ThemePicker,
 }
 
 /// Nvim-style visual selection: charwise (`v`) or linewise (`V`).
@@ -592,6 +601,9 @@ impl App {
             full_hit: std::cell::RefCell::new(Vec::new()),
             prev_hit: std::cell::RefCell::new(Vec::new()),
             finder_hit: std::cell::RefCell::new(Vec::new()),
+            theme_hit: std::cell::RefCell::new(Vec::new()),
+            theme_selected: 0,
+            theme_before: config.theme,
             browser_hit: std::cell::RefCell::new(Vec::new()),
         };
         app.refresh();
@@ -932,6 +944,99 @@ impl App {
         self.theme
     }
 
+    /// Apply a theme chosen in another project tab (the picker is global).
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+    }
+
+    /// Highlighted row of the theme picker.
+    pub fn theme_selected(&self) -> usize {
+        self.theme_selected
+    }
+
+    /// `T`: open the theme picker on the active theme, over the main view
+    /// so the preview shows real content.
+    pub fn begin_theme_picker(&mut self) {
+        if self.mode != Mode::Normal {
+            return;
+        }
+        self.theme_before = self.theme;
+        // `default` and `catppuccin` are the same palette; the first match
+        // (`default`) wins, which is what the config would say too.
+        self.theme_selected = Theme::names()
+            .position(|name| Theme::by_name(name).is_ok_and(|t| t == self.theme))
+            .unwrap_or(0);
+        self.mode = Mode::ThemePicker;
+        self.error = None;
+        self.notice = None;
+    }
+
+    /// Move the picker selection (wrapping) and preview that theme.
+    fn theme_picker_move(&mut self, delta: isize) {
+        let count = Theme::names().count() as isize;
+        let next = (self.theme_selected as isize + delta).rem_euclid(count);
+        self.theme_picker_select(next as usize);
+    }
+
+    fn theme_picker_select(&mut self, index: usize) {
+        if let Some(theme) = Theme::names()
+            .nth(index)
+            .and_then(|name| Theme::by_name(name).ok())
+        {
+            self.theme_selected = index;
+            self.theme = theme;
+        }
+    }
+
+    /// Enter: keep the previewed theme and persist `[theme] name`.
+    fn confirm_theme_picker(&mut self) {
+        self.mode = Mode::Normal;
+        let Some(name) = Theme::names().nth(self.theme_selected) else {
+            return;
+        };
+        match self.config_path.clone() {
+            Some(path) => match Config::save_theme_to_path(&path, name) {
+                Ok(()) => {
+                    self.notice = Some(format!("theme {name} saved to {}", path.display()));
+                }
+                // The theme still applies; only persisting it failed.
+                Err(e) => self.error = Some(format!("theme {name} not saved: {e:#}")),
+            },
+            None => self.notice = Some(format!("theme {name} set for this session")),
+        }
+    }
+
+    /// Esc: back to the theme that was active when the picker opened.
+    fn cancel_theme_picker(&mut self) {
+        self.theme = self.theme_before;
+        self.mode = Mode::Normal;
+    }
+
+    fn on_key_theme_picker(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => self.theme_picker_move(1),
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => self.theme_picker_move(-1),
+            KeyCode::Home => self.theme_picker_select(0),
+            KeyCode::End => self.theme_picker_select(Theme::names().count().saturating_sub(1)),
+            KeyCode::Enter => self.confirm_theme_picker(),
+            KeyCode::Esc => self.cancel_theme_picker(),
+            _ => {}
+        }
+    }
+
+    /// Click a theme row: preview it, or keep it when it is already
+    /// selected (mouse double-click without a timer).
+    fn click_theme_picker(&mut self, row: u16) {
+        let Some(index) = self.hit(HitMap::ThemePicker, row) else {
+            return;
+        };
+        if index == self.theme_selected {
+            self.confirm_theme_picker();
+        } else {
+            self.theme_picker_select(index);
+        }
+    }
+
     /// Quit regardless of bindings (Ctrl-C safety hatch in the event loop).
     pub fn request_quit(&mut self) {
         self.quit = true;
@@ -1104,6 +1209,7 @@ impl App {
             HitMap::Preview => *self.prev_hit.borrow_mut() = rows,
             HitMap::Finder => *self.finder_hit.borrow_mut() = rows,
             HitMap::Browser => *self.browser_hit.borrow_mut() = rows,
+            HitMap::ThemePicker => *self.theme_hit.borrow_mut() = rows,
         }
     }
 
@@ -1120,6 +1226,7 @@ impl App {
             HitMap::Preview => self.prev_hit.borrow(),
             HitMap::Finder => self.finder_hit.borrow(),
             HitMap::Browser => self.browser_hit.borrow(),
+            HitMap::ThemePicker => self.theme_hit.borrow(),
         }
     }
 
@@ -1678,6 +1785,10 @@ impl App {
             self.on_key_llm_settings(key);
             return;
         }
+        if self.mode == Mode::ThemePicker {
+            self.on_key_theme_picker(key);
+            return;
+        }
         if self.mode == Mode::FullDiff {
             self.on_key_full_diff(key);
             return;
@@ -1750,7 +1861,8 @@ impl App {
                     | Mode::OpenProject
                     | Mode::ConfirmInit
                     | Mode::ConfirmPush
-                    | Mode::LlmSettings => {}
+                    | Mode::LlmSettings
+                    | Mode::ThemePicker => {}
                 },
                 KeyCode::Esc => {
                     self.mode = match self.mode {
@@ -1888,6 +2000,8 @@ impl App {
             self.toggle_markdown_preview();
         } else if k.llm_settings.contains(&key) {
             self.begin_llm_settings();
+        } else if k.theme_picker.contains(&key) {
+            self.begin_theme_picker();
         } else if k.find_files.contains(&key) {
             self.open_finder();
         } else if k.refresh.contains(&key) {
@@ -2264,6 +2378,10 @@ impl App {
                 self.click_confirm_push(col, row);
                 return;
             }
+            Mode::ThemePicker => {
+                self.click_theme_picker(row);
+                return;
+            }
             Mode::Normal | Mode::FullDiff => {}
             _ => return,
         }
@@ -2622,6 +2740,7 @@ impl App {
             FooterAction::Pull => self.start_pull(),
             FooterAction::Push => self.start_push(),
             FooterAction::Find => self.open_finder(),
+            FooterAction::Theme => self.begin_theme_picker(),
             FooterAction::OpenDiff => self.open_full_diff(),
             FooterAction::CloseDiff => {
                 if self.mode == Mode::FullDiff {
@@ -6863,5 +6982,76 @@ mod tests {
         // Round-trips through the real config file.
         let cfg = Config::load_from_path(&cfg_path).unwrap();
         assert_eq!(cfg.llm.provider, "ollama");
+    }
+
+    #[test]
+    fn theme_picker_previews_live_and_esc_restores() {
+        let mut fx = harness(&["a.txt"]);
+        let before = fx.app.theme();
+        fx.app.on_key(KeyCode::Char('T'));
+        assert_eq!(fx.app.mode(), Mode::ThemePicker);
+        // Opens on the active theme (`default`, row 0).
+        assert_eq!(fx.app.theme_selected(), 0);
+        fx.app.on_key(KeyCode::Down);
+        assert_eq!(fx.app.theme(), Theme::by_name("tokyo-night").unwrap());
+        // Wraps upward from the first row to the last theme.
+        fx.app.on_key(KeyCode::Up);
+        fx.app.on_key(KeyCode::Up);
+        let last = Theme::names().last().unwrap();
+        assert_eq!(fx.app.theme(), Theme::by_name(last).unwrap());
+        // Keys that act elsewhere are inert inside the picker.
+        fx.app.on_key(KeyCode::Char('d'));
+        assert_eq!(fx.app.mode(), Mode::ThemePicker);
+        fx.app.on_key(KeyCode::Esc);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        assert_eq!(fx.app.theme(), before);
+    }
+
+    #[test]
+    fn theme_picker_enter_keeps_theme_and_saves_config() {
+        use crate::config::Config;
+        let mut fx = harness(&["a.txt"]);
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        fx.app.set_config_path(Some(cfg_path.clone()));
+        fx.app.on_key(KeyCode::Char('T'));
+        let gruvbox = Theme::names().position(|n| n == "gruvbox").unwrap();
+        for _ in 0..gruvbox {
+            fx.app.on_key(KeyCode::Char('j'));
+        }
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        assert_eq!(fx.app.theme(), Theme::by_name("gruvbox").unwrap());
+        assert!(fx.app.notice().unwrap_or("").contains("gruvbox"));
+        let cfg = Config::load_from_path(&cfg_path).unwrap();
+        assert_eq!(cfg.theme, Theme::by_name("gruvbox").unwrap());
+        // Reopening starts on the theme that is now active.
+        fx.app.on_key(KeyCode::Char('T'));
+        assert_eq!(fx.app.theme_selected(), gruvbox);
+    }
+
+    #[test]
+    fn theme_picker_without_config_path_applies_for_the_session() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('T'));
+        fx.app.on_key(KeyCode::End);
+        fx.app.on_key(KeyCode::Enter);
+        let last = Theme::names().last().unwrap();
+        assert_eq!(fx.app.theme(), Theme::by_name(last).unwrap());
+        assert!(fx.app.notice().unwrap_or("").contains("this session"));
+    }
+
+    #[test]
+    fn theme_picker_click_previews_then_second_click_keeps() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('T'));
+        fx.app
+            .set_hit(HitMap::ThemePicker, vec![(5, 0), (6, 1), (7, 2)]);
+        fx.app.on_mouse_down(10, 6);
+        assert_eq!(fx.app.mode(), Mode::ThemePicker);
+        assert_eq!(fx.app.theme(), Theme::by_name("tokyo-night").unwrap());
+        fx.app.on_mouse_down(10, 6);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        assert_eq!(fx.app.theme(), Theme::by_name("tokyo-night").unwrap());
     }
 }
