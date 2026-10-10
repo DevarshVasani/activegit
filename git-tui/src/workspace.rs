@@ -468,6 +468,7 @@ impl Workspace {
             MouseAction::ScrollDown(col, row) => self.current_mut().on_wheel(col, row, false),
         }
         self.sync_theme();
+        self.run_menu_request();
     }
 
     /// Click a project-browser row: select it, or activate it when it is
@@ -580,6 +581,25 @@ impl Workspace {
         }
         self.current_mut().on_key_with_modifiers(key, shift_held);
         self.sync_theme();
+        self.run_menu_request();
+    }
+
+    /// Carry out a project action picked in the actions menu (the menu
+    /// lives in one tab; opening, switching and closing tabs happen here).
+    fn run_menu_request(&mut self) {
+        use crate::menu::WorkspaceRequest;
+        let Some(request) = self.current_mut().take_workspace_request() else {
+            return;
+        };
+        match request {
+            WorkspaceRequest::Open => {
+                let start = self.roots[self.current].clone();
+                self.current_mut().begin_open_project(start);
+            }
+            WorkspaceRequest::Next => self.next(),
+            WorkspaceRequest::Prev => self.prev(),
+            WorkspaceRequest::Close => self.close_current_project(),
+        }
     }
 
     /// The theme picker runs inside one project tab but the theme is
@@ -1493,5 +1513,32 @@ mod tests {
         // Esc restores every tab, not just the one showing the picker.
         ws.on_key(KeyCode::Esc);
         assert!(ws.apps.iter().all(|app| app.theme() == before));
+    }
+
+    #[test]
+    fn actions_menu_can_open_the_project_browser() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ws.on_key(KeyCode::Char('?'));
+        assert_eq!(ws.current().mode(), Mode::ActionMenu);
+        type_text(&mut ws, "open project");
+        ws.on_key(KeyCode::Enter);
+        assert_eq!(ws.current().mode(), Mode::OpenProject);
+    }
+
+    #[test]
+    fn typing_q_in_the_actions_menu_does_not_close_the_project() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let b = init_repo_with_file("b", "b.txt", "b\n");
+        let mut ws = Workspace::open(
+            vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            Config::default(),
+        )
+        .unwrap();
+        ws.on_key(KeyCode::Char('?'));
+        type_text(&mut ws, "q]o");
+        assert_eq!(ws.apps.len(), 2);
+        assert_eq!(ws.current().mode(), Mode::ActionMenu);
+        assert_eq!(ws.current().draft(), "q]o");
     }
 }

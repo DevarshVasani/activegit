@@ -304,6 +304,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::ConfirmPush => render_confirm_push_modal(frame, area, app),
         Mode::LlmSettings => render_llm_modal(frame, area, app),
         Mode::ThemePicker => render_theme_modal(frame, area, app),
+        Mode::ActionMenu => render_action_menu(frame, area, app),
         Mode::FindFile => {
             // Opened fullscreen: keep the diff behind the modal.
             if app.finder_return() == Mode::FullDiff {
@@ -371,6 +372,7 @@ pub fn render_workspace(frame: &mut Frame, ws: &Workspace) {
         Mode::ConfirmPush => render_confirm_push_modal(frame, body, app),
         Mode::LlmSettings => render_llm_modal(frame, body, app),
         Mode::ThemePicker => render_theme_modal(frame, body, app),
+        Mode::ActionMenu => render_action_menu(frame, body, app),
         Mode::FindFile => {
             if app.finder_return() == Mode::FullDiff {
                 render_fullscreen_diff(frame, body, app);
@@ -2258,6 +2260,7 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
         Mode::FindFile => "type to filter · ↑/↓ move · ←/→ edit · enter open · esc cancel",
         Mode::LlmSettings => "tab/↑↓ switch field · ←/→ choose/edit · enter save · esc cancel",
         Mode::ThemePicker => "↑/↓ preview · enter keep + save · esc cancel",
+        Mode::ActionMenu => "type to filter · ↑/↓ move · enter run · esc close",
         Mode::OpenProject => {
             "type to filter · ↑/↓ move · enter open/descend · → descend · ← up · tab jump to path · esc clear/close"
         }
@@ -2286,7 +2289,10 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
 
 /// Clickable footer buttons: mouse users get the core actions without
 /// memorizing keys. Mirrors the keyboard bindings for the current
-/// mode/focus; see [`App::click_footer_button`].
+/// mode/focus; see [`App::click_footer_button`]. Actions that throw work
+/// away (discard, restore hunk, delete branch, drop stash) are not on the
+/// bar, where a stray click would fire them: they live in the actions
+/// menu (`[Menu]`), which asks for confirmation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FooterAction {
     Stage,
@@ -2306,6 +2312,7 @@ pub(crate) enum FooterAction {
     StashPush,
     StashDrop,
     Theme,
+    Menu,
 }
 
 pub(crate) fn footer_buttons(app: &App) -> Vec<(&'static str, FooterAction)> {
@@ -2313,8 +2320,6 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<(&'static str, FooterAction)> {
     match app.mode() {
         Mode::FullDiff => vec![
             ("Stage hunk", StageHunk),
-            ("Restore hunk", RestoreHunk),
-            ("Discard file", Discard),
             ("Close", CloseDiff),
             ("Find", Find),
             ("Pull", Pull),
@@ -2323,30 +2328,30 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<(&'static str, FooterAction)> {
         Mode::Normal if app.focus() == Focus::Branches => vec![
             ("Checkout", Checkout),
             ("New", NewBranch),
-            ("Delete", DeleteBranch),
             ("Find", Find),
+            ("Menu", Menu),
         ],
         Mode::Normal if app.focus() == Focus::Stash => vec![
             ("Pop", StashPop),
             ("Stash", StashPush),
-            ("Drop", StashDrop),
             ("Find", Find),
+            ("Menu", Menu),
         ],
         Mode::Normal if app.focus() == Focus::Diff => vec![
             ("Stage hunk", StageHunk),
-            ("Restore hunk", RestoreHunk),
             ("Full screen", OpenDiff),
             ("Find", Find),
+            ("Menu", Menu),
         ],
         Mode::Normal => vec![
             ("Stage", Stage),
-            ("Discard", Discard),
             ("Commit", Commit),
             ("Pull", Pull),
             ("Push", Push),
             ("Find", Find),
             ("Diff", OpenDiff),
             ("Theme", Theme),
+            ("Menu", Menu),
         ],
         _ => vec![("Find", Find)],
     }
@@ -2533,6 +2538,133 @@ fn render_theme_modal(frame: &mut Frame, area: Rect, app: &App) {
     }
     app.set_hit(HitMap::ThemePicker, hit);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// Actions menu (`?`): filter line, then every matching action with its
+/// key on the right. Group headings separate the unfiltered list. A
+/// destructive entry waiting for its second Enter replaces the last line
+/// with a confirmation naming what it will act on.
+fn render_action_menu(frame: &mut Frame, area: Rect, app: &App) {
+    enum Row {
+        Heading(&'static str),
+        Entry(usize),
+    }
+    let theme = app.theme();
+    let matches = app.menu_matches();
+    let selected = app.menu_selected();
+    let grouped = app.draft().trim().is_empty();
+    let mut rows: Vec<Row> = Vec::new();
+    for (i, entry) in matches.iter().enumerate() {
+        if grouped && (i == 0 || matches[i - 1].group != entry.group) {
+            rows.push(Row::Heading(entry.group));
+        }
+        rows.push(Row::Entry(i));
+    }
+    let confirming = app.menu_confirming();
+    // Borders + filter line + rows + a line kept free for the confirm.
+    let popup = centered_rect(area, 64, rows.len() as u16 + 4);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), popup);
+    let block = panel_block(true, theme, " Actions ".to_string());
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let inner_h = popup.height.saturating_sub(2) as usize;
+    let plain = Style::default().fg(theme.fg).bg(theme.bg);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_h);
+    let (query, query_cursor) =
+        input_window(app.draft(), app.draft_cursor(), inner_w.saturating_sub(2));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "> ",
+            Style::default()
+                .fg(theme.border_focused)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(query, plain),
+    ]));
+    // Window over the rows that keeps the selection (and, when it is the
+    // first of its group, its heading) on screen.
+    let visible = inner_h.saturating_sub(2);
+    let selected_row = rows
+        .iter()
+        .position(|r| matches!(r, Row::Entry(i) if *i == selected))
+        .unwrap_or(0);
+    let start = (selected_row + 1).saturating_sub(visible);
+    let start = if start == 1 { 0 } else { start };
+    if matches.is_empty() {
+        lines.push(Line::styled(
+            "(no matching action)",
+            Style::default().fg(theme.hint).bg(theme.bg),
+        ));
+    }
+    let mut hit: Vec<(u16, usize)> = Vec::new();
+    for row in rows.iter().skip(start).take(visible) {
+        match row {
+            Row::Heading(group) => lines.push(Line::styled(
+                group.to_string(),
+                Style::default().fg(theme.hint).bg(theme.bg),
+            )),
+            Row::Entry(i) => {
+                hit.push((popup.y + 1 + lines.len() as u16, *i));
+                let entry = matches[*i];
+                let is_selected = *i == selected;
+                let style = if is_selected {
+                    selection_style(theme)
+                } else {
+                    plain
+                };
+                let marker = if is_selected { "> " } else { "  " };
+                // Filtered results lose their headings, so name the group.
+                let label = if grouped {
+                    entry.label.to_string()
+                } else {
+                    format!("{}: {}", entry.group, entry.label)
+                };
+                let key = crate::menu::key_hint(entry.action, app.keys());
+                let pad = inner_w.saturating_sub(marker.width() + label.width() + key.width() + 1);
+                let label_style = if entry.destructive {
+                    style.fg(theme.error)
+                } else {
+                    style
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(marker.to_string(), style),
+                    Span::styled(label, label_style),
+                    Span::styled(" ".repeat(pad), style),
+                    Span::styled(format!("{key} "), style.fg(theme.hint)),
+                ]));
+            }
+        }
+    }
+    app.set_hit(HitMap::ActionMenu, hit);
+    if let Some((entry, target)) = &confirming {
+        while lines.len() + 1 < inner_h {
+            lines.push(Line::styled(String::new(), plain));
+        }
+        let what = if target.is_empty() {
+            entry.label.to_string()
+        } else {
+            format!("{}: {target}", entry.label)
+        };
+        // Keep the target visible on narrow popups: drop the hint first.
+        let mut text = format!("{what}? enter confirms · any other key cancels");
+        if text.width() > inner_w {
+            text = format!("{what}? enter confirms");
+        }
+        lines.push(Line::styled(
+            text,
+            Style::default()
+                .fg(theme.error)
+                .bg(theme.bg)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+    if confirming.is_none() {
+        let cursor_x = popup.x + 1 + 2 + query_cursor as u16;
+        if cursor_x < popup.x + popup.width.saturating_sub(1) {
+            frame.set_cursor_position((cursor_x, popup.y + 1));
+        }
+    }
 }
 
 /// Commit modal title: shows the generating state while the LLM call is
@@ -4042,7 +4174,10 @@ mod tests {
         // Buttons lay out as `[label] ` left to right.
         assert_eq!(footer_button_at(&buttons, 0), Some(FooterAction::Stage));
         assert_eq!(footer_button_at(&buttons, 7), Some(FooterAction::Stage));
-        assert_eq!(footer_button_at(&buttons, 8), Some(FooterAction::Discard));
+        assert_eq!(footer_button_at(&buttons, 8), Some(FooterAction::Commit));
+        // Nothing on the bar throws work away; that lives behind the menu.
+        assert!(!buttons.iter().any(|(_, a)| *a == FooterAction::Discard));
+        assert!(buttons.iter().any(|(_, a)| *a == FooterAction::Menu));
         assert_eq!(footer_button_at(&buttons, 10_000), None);
     }
 
@@ -5808,5 +5943,50 @@ mod tests {
         assert_eq!(before[(0, 0)].bg, Theme::default_theme().bg);
         assert_eq!(after[(0, 0)].bg, Theme::by_name("tokyo-night").unwrap().bg);
         assert!(screen(&app, 100, 32).contains("> tokyo-night"));
+    }
+
+    #[test]
+    fn action_menu_lists_grouped_actions_with_their_keys() {
+        use crossterm::event::KeyCode;
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        app.on_key(KeyCode::Char('?'));
+        let s = screen(&app, 110, 50);
+        assert!(s.contains("Actions"), "menu title missing:\n{s}");
+        for text in ["Sync", "Settings", "Stage / unstage selected", "Theme"] {
+            assert!(s.contains(text), "{text} missing:\n{s}");
+        }
+        // The key column: `space` stages.
+        let stage = s
+            .lines()
+            .find(|l| l.contains("Stage / unstage selected"))
+            .unwrap();
+        assert!(stage.contains("space"), "key hint missing: {stage}");
+    }
+
+    #[test]
+    fn action_menu_confirm_line_names_the_target() {
+        use crossterm::event::KeyCode;
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        app.on_key(KeyCode::Char('?'));
+        for c in "discard".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.on_key(KeyCode::Enter);
+        let s = screen(&app, 110, 40);
+        assert!(
+            s.contains("Discard changes: a.txt? enter confirms"),
+            "confirm line missing:\n{s}"
+        );
+    }
+
+    #[test]
+    fn action_menu_fits_a_short_terminal_and_follows_the_selection() {
+        use crossterm::event::KeyCode;
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        app.on_key(KeyCode::Char('?'));
+        // Far fewer rows than entries: wrap up to the last entry.
+        app.on_key(KeyCode::Up);
+        let s = screen(&app, 100, 16);
+        assert!(s.contains("> Quit"), "last entry not visible:\n{s}");
     }
 }

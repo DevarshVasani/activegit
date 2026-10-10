@@ -17,6 +17,7 @@ use std::cell::Cell;
 
 use crate::config::{Config, KeyBindings, Theme};
 use crate::fuzzy;
+use crate::menu::{MenuAction, MenuEntry, WorkspaceRequest};
 use crate::ui::{
     cursor_line_text, diff_rows, footer_button_at, footer_buttons, panel_divider_ys,
     rail_divider_x, visible_file_rows, wrap_draft, DiffRow, FileRow, FooterAction, LayoutOverrides,
@@ -61,6 +62,9 @@ pub enum Mode {
     /// In-TUI theme picker (`T`): moving the selection previews the theme
     /// live, Enter keeps it and saves `[theme]`, Esc restores the old one.
     ThemePicker,
+    /// Actions menu (`?`): a searchable list of every action. The draft is
+    /// the filter; Enter runs the highlighted entry.
+    ActionMenu,
 }
 
 /// Which panel receives navigation keys. Everything is vertical: Tab cycles
@@ -255,6 +259,13 @@ pub struct App {
     prev_hit: std::cell::RefCell<Vec<(u16, usize)>>,
     finder_hit: std::cell::RefCell<Vec<(u16, usize)>>,
     theme_hit: std::cell::RefCell<Vec<(u16, usize)>>,
+    menu_hit: std::cell::RefCell<Vec<(u16, usize)>>,
+    /// Actions menu: highlighted row among the filtered entries, and
+    /// whether a destructive entry is waiting for its second Enter.
+    menu_selected: usize,
+    menu_confirm: bool,
+    /// A menu action only the workspace can run (it owns the tabs).
+    workspace_request: Option<WorkspaceRequest>,
     /// Theme picker: highlighted row (index into [`Theme::names`]) and the
     /// theme to restore on Esc.
     theme_selected: usize,
@@ -279,6 +290,7 @@ pub(crate) enum HitMap {
     Finder,
     Browser,
     ThemePicker,
+    ActionMenu,
 }
 
 /// Nvim-style visual selection: charwise (`v`) or linewise (`V`).
@@ -602,6 +614,10 @@ impl App {
             prev_hit: std::cell::RefCell::new(Vec::new()),
             finder_hit: std::cell::RefCell::new(Vec::new()),
             theme_hit: std::cell::RefCell::new(Vec::new()),
+            menu_hit: std::cell::RefCell::new(Vec::new()),
+            menu_selected: 0,
+            menu_confirm: false,
+            workspace_request: None,
             theme_selected: 0,
             theme_before: config.theme,
             browser_hit: std::cell::RefCell::new(Vec::new()),
@@ -944,6 +960,11 @@ impl App {
         self.theme
     }
 
+    /// Active key bindings (the actions menu shows each action's key).
+    pub(crate) fn keys(&self) -> &KeyBindings {
+        &self.keys
+    }
+
     /// Apply a theme chosen in another project tab (the picker is global).
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
@@ -1021,6 +1042,194 @@ impl App {
             KeyCode::Enter => self.confirm_theme_picker(),
             KeyCode::Esc => self.cancel_theme_picker(),
             _ => {}
+        }
+    }
+
+    /// `?`: open the actions menu for the focused panel.
+    pub fn begin_action_menu(&mut self) {
+        if self.mode != Mode::Normal {
+            return;
+        }
+        self.mode = Mode::ActionMenu;
+        self.draft.clear();
+        self.draft_cursor = 0;
+        self.menu_selected = 0;
+        self.menu_confirm = false;
+        self.error = None;
+        self.notice = None;
+    }
+
+    /// Menu entries matching the filter: menu order with no filter, best
+    /// match first otherwise. Labels are matched first; group names match
+    /// too (`sync`, `stash`) and those entries follow.
+    pub(crate) fn menu_matches(&self) -> Vec<MenuEntry> {
+        let all = crate::menu::entries(self.focus);
+        let query = self.draft.trim().to_lowercase();
+        if query.is_empty() {
+            return all;
+        }
+        let ranked = |text: &dyn Fn(&MenuEntry) -> String| -> Vec<usize> {
+            let haystack: Vec<String> = all.iter().map(|e| text(e).to_lowercase()).collect();
+            let refs: Vec<&str> = haystack.iter().map(String::as_str).collect();
+            crate::fuzzy::rank(&query, &refs)
+                .into_iter()
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let mut order = ranked(&|e| e.label.to_string());
+        for i in ranked(&|e| format!("{} {}", e.group, e.label)) {
+            if !order.contains(&i) {
+                order.push(i);
+            }
+        }
+        order.into_iter().map(|i| all[i]).collect()
+    }
+
+    /// Highlighted row among [`Self::menu_matches`].
+    pub fn menu_selected(&self) -> usize {
+        self.menu_selected
+    }
+
+    /// The destructive entry waiting for a second Enter, with what it will
+    /// act on (the selection behind the menu), for the confirm line.
+    pub(crate) fn menu_confirming(&self) -> Option<(MenuEntry, String)> {
+        if !self.menu_confirm {
+            return None;
+        }
+        let entry = *self.menu_matches().get(self.menu_selected)?;
+        Some((entry, self.menu_target(entry.action).unwrap_or_default()))
+    }
+
+    fn menu_target(&self, action: MenuAction) -> Option<String> {
+        let MenuAction::Footer(action) = action else {
+            return None;
+        };
+        match action {
+            FooterAction::Discard => match self.cursor_dir() {
+                Some(dir) => Some(format!("{dir}/")),
+                None => self.selected_file().map(|e| e.path.clone()),
+            },
+            FooterAction::RestoreHunk => self
+                .diff
+                .as_ref()
+                .map(|d| format!("hunk {} of {}", self.hunk + 1, d.path)),
+            FooterAction::DeleteBranch => self.selected_branch().map(|b| b.name),
+            FooterAction::StashDrop => self.selected_stash().map(|s| s.message),
+            _ => None,
+        }
+    }
+
+    fn menu_move(&mut self, delta: isize) {
+        let count = self.menu_matches().len() as isize;
+        if count > 0 {
+            self.menu_selected = (self.menu_selected as isize + delta).rem_euclid(count) as usize;
+        }
+    }
+
+    fn close_action_menu(&mut self) {
+        self.mode = Mode::Normal;
+        self.draft.clear();
+        self.draft_cursor = 0;
+        self.menu_confirm = false;
+    }
+
+    /// Enter: run the highlighted entry. A destructive one arms the confirm
+    /// line first and only runs on the next Enter.
+    fn activate_menu_entry(&mut self) {
+        let Some(entry) = self.menu_matches().get(self.menu_selected).copied() else {
+            return;
+        };
+        if entry.destructive && !self.menu_confirm {
+            self.menu_confirm = true;
+            return;
+        }
+        self.close_action_menu();
+        self.run_menu_action(entry.action);
+    }
+
+    fn run_menu_action(&mut self, action: MenuAction) {
+        match action {
+            // The creation prompts belong to their panel: move there first
+            // so the button semantics (and Esc) behave as if opened by key.
+            MenuAction::Footer(FooterAction::NewBranch) => {
+                self.focus = Focus::Branches;
+                self.maybe_load_branches();
+                self.click_footer_button(FooterAction::NewBranch);
+            }
+            MenuAction::Footer(FooterAction::StashPush) => {
+                self.focus = Focus::Stash;
+                self.maybe_load_stash();
+                self.click_footer_button(FooterAction::StashPush);
+            }
+            MenuAction::Footer(action) => self.click_footer_button(action),
+            MenuAction::Refresh => self.refresh(),
+            MenuAction::MarkdownPreview => self.toggle_markdown_preview(),
+            MenuAction::LlmSettings => self.begin_llm_settings(),
+            MenuAction::Focus(focus) => {
+                self.focus = focus;
+                self.maybe_load_branches();
+                self.maybe_load_log();
+                self.maybe_load_stash();
+            }
+            MenuAction::Workspace(request) => self.workspace_request = Some(request),
+            MenuAction::Quit => self.quit = true,
+        }
+    }
+
+    /// A menu action the workspace has to carry out, if one was picked.
+    pub(crate) fn take_workspace_request(&mut self) -> Option<WorkspaceRequest> {
+        self.workspace_request.take()
+    }
+
+    /// Keys inside the actions menu: typing filters, `↑/↓` move, Enter
+    /// runs. While a destructive entry waits for confirmation, Enter
+    /// confirms and every other key backs out of the confirmation only.
+    fn on_key_action_menu(&mut self, key: KeyCode) {
+        if self.menu_confirm {
+            match key {
+                KeyCode::Enter => self.activate_menu_entry(),
+                _ => self.menu_confirm = false,
+            }
+            return;
+        }
+        match key {
+            KeyCode::Up | KeyCode::BackTab => self.menu_move(-1),
+            KeyCode::Down | KeyCode::Tab => self.menu_move(1),
+            KeyCode::Left => self.move_draft_left(),
+            KeyCode::Right => self.move_draft_right(),
+            KeyCode::Home => self.move_draft_home(),
+            KeyCode::End => self.move_draft_end(),
+            KeyCode::Char(c) => {
+                self.insert_draft_char(c);
+                self.menu_selected = 0;
+            }
+            KeyCode::Backspace => {
+                self.delete_draft_before();
+                self.menu_selected = 0;
+            }
+            KeyCode::Delete => {
+                self.delete_draft_after();
+                self.menu_selected = 0;
+            }
+            KeyCode::Enter => self.activate_menu_entry(),
+            KeyCode::Esc => self.close_action_menu(),
+            _ => {}
+        }
+    }
+
+    /// Click a menu row: select it, or run it when it is already selected
+    /// (mouse double-click without a timer). Clicking elsewhere backs out
+    /// of a pending confirmation.
+    fn click_action_menu(&mut self, row: u16) {
+        let Some(index) = self.hit(HitMap::ActionMenu, row) else {
+            self.menu_confirm = false;
+            return;
+        };
+        if index == self.menu_selected {
+            self.activate_menu_entry();
+        } else {
+            self.menu_selected = index;
+            self.menu_confirm = false;
         }
     }
 
@@ -1210,6 +1419,7 @@ impl App {
             HitMap::Finder => *self.finder_hit.borrow_mut() = rows,
             HitMap::Browser => *self.browser_hit.borrow_mut() = rows,
             HitMap::ThemePicker => *self.theme_hit.borrow_mut() = rows,
+            HitMap::ActionMenu => *self.menu_hit.borrow_mut() = rows,
         }
     }
 
@@ -1227,6 +1437,7 @@ impl App {
             HitMap::Finder => self.finder_hit.borrow(),
             HitMap::Browser => self.browser_hit.borrow(),
             HitMap::ThemePicker => self.theme_hit.borrow(),
+            HitMap::ActionMenu => self.menu_hit.borrow(),
         }
     }
 
@@ -1789,6 +2000,10 @@ impl App {
             self.on_key_theme_picker(key);
             return;
         }
+        if self.mode == Mode::ActionMenu {
+            self.on_key_action_menu(key);
+            return;
+        }
         if self.mode == Mode::FullDiff {
             self.on_key_full_diff(key);
             return;
@@ -1862,7 +2077,8 @@ impl App {
                     | Mode::ConfirmInit
                     | Mode::ConfirmPush
                     | Mode::LlmSettings
-                    | Mode::ThemePicker => {}
+                    | Mode::ThemePicker
+                    | Mode::ActionMenu => {}
                 },
                 KeyCode::Esc => {
                     self.mode = match self.mode {
@@ -2002,6 +2218,8 @@ impl App {
             self.begin_llm_settings();
         } else if k.theme_picker.contains(&key) {
             self.begin_theme_picker();
+        } else if k.action_menu.contains(&key) {
+            self.begin_action_menu();
         } else if k.find_files.contains(&key) {
             self.open_finder();
         } else if k.refresh.contains(&key) {
@@ -2382,6 +2600,10 @@ impl App {
                 self.click_theme_picker(row);
                 return;
             }
+            Mode::ActionMenu => {
+                self.click_action_menu(row);
+                return;
+            }
             Mode::Normal | Mode::FullDiff => {}
             _ => return,
         }
@@ -2741,6 +2963,7 @@ impl App {
             FooterAction::Push => self.start_push(),
             FooterAction::Find => self.open_finder(),
             FooterAction::Theme => self.begin_theme_picker(),
+            FooterAction::Menu => self.begin_action_menu(),
             FooterAction::OpenDiff => self.open_full_diff(),
             FooterAction::CloseDiff => {
                 if self.mode == Mode::FullDiff {
@@ -7053,5 +7276,113 @@ mod tests {
         fx.app.on_mouse_down(10, 6);
         assert_eq!(fx.app.mode(), Mode::Normal);
         assert_eq!(fx.app.theme(), Theme::by_name("tokyo-night").unwrap());
+    }
+
+    fn type_into_menu(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn action_menu_filters_and_runs_the_selected_action() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('?'));
+        assert_eq!(fx.app.mode(), Mode::ActionMenu);
+        let all = fx.app.menu_matches().len();
+        type_into_menu(&mut fx.app, "commit");
+        let matches = fx.app.menu_matches();
+        assert!(matches.len() < all);
+        assert_eq!(matches[0].label, "Commit");
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::Committing);
+        // The filter text must not leak into the commit message.
+        assert_eq!(fx.app.draft(), "");
+    }
+
+    #[test]
+    fn action_menu_typed_keys_never_fire_their_bindings() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('?'));
+        // `d` discards and `Q` quits in the file list; here they are text.
+        type_into_menu(&mut fx.app, "dQ");
+        assert_eq!(fx.app.mode(), Mode::ActionMenu);
+        assert_eq!(fx.app.draft(), "dQ");
+        assert!(!fx.app.should_quit());
+        fx.app.on_key(KeyCode::Esc);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        assert_eq!(fx.app.draft(), "");
+    }
+
+    #[test]
+    fn action_menu_destructive_entry_needs_a_second_enter() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('?'));
+        type_into_menu(&mut fx.app, "discard");
+        assert_eq!(fx.app.menu_matches()[0].label, "Discard changes");
+        fx.app.on_key(KeyCode::Enter);
+        // Armed, not run: still open, naming the file it would discard.
+        assert_eq!(fx.app.mode(), Mode::ActionMenu);
+        let (entry, target) = fx.app.menu_confirming().unwrap();
+        assert!(entry.destructive);
+        assert_eq!(target, "a.txt");
+        // Any other key backs out of the confirmation only.
+        fx.app.on_key(KeyCode::Esc);
+        assert_eq!(fx.app.mode(), Mode::ActionMenu);
+        assert!(fx.app.menu_confirming().is_none());
+        fx.app.poll();
+        let status = fx.app.status().unwrap();
+        assert!(status.files.iter().any(|e| e.path == "a.txt"));
+        // Enter twice discards for real.
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        wait_for(&mut fx.app, |st| st.files.is_empty());
+    }
+
+    #[test]
+    fn action_menu_new_branch_moves_to_the_branches_panel() {
+        let mut fx = harness(&["a.txt"]);
+        assert_eq!(fx.app.focus(), Focus::Status);
+        fx.app.on_key(KeyCode::Char('?'));
+        type_into_menu(&mut fx.app, "new branch");
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::NewBranch);
+        assert_eq!(fx.app.focus(), Focus::Branches);
+    }
+
+    #[test]
+    fn action_menu_project_actions_are_handed_to_the_workspace() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('?'));
+        type_into_menu(&mut fx.app, "open project");
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        assert_eq!(
+            fx.app.take_workspace_request(),
+            Some(WorkspaceRequest::Open)
+        );
+        assert_eq!(fx.app.take_workspace_request(), None);
+    }
+
+    #[test]
+    fn menu_button_opens_the_menu_and_rows_are_clickable() {
+        let mut fx = harness(&["a.txt"]);
+        let layout = mouse_layout(&mut fx.app);
+        fx.app
+            .on_mouse_down(button_x(&fx.app, "Menu") + 1, layout.footer.y);
+        assert_eq!(fx.app.mode(), Mode::ActionMenu);
+        let commit = fx
+            .app
+            .menu_matches()
+            .iter()
+            .position(|e| e.label == "Commit")
+            .unwrap();
+        fx.app.set_hit(HitMap::ActionMenu, vec![(9, commit)]);
+        fx.app.on_mouse_down(20, 9);
+        assert_eq!(fx.app.mode(), Mode::ActionMenu);
+        assert_eq!(fx.app.menu_selected(), commit);
+        fx.app.on_mouse_down(20, 9);
+        assert_eq!(fx.app.mode(), Mode::Committing);
     }
 }

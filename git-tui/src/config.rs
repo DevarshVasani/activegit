@@ -46,6 +46,7 @@ pub const ACTIONS: &[&str] = &[
     "llm_settings",
     "toggle_markdown_preview",
     "theme_picker",
+    "action_menu",
 ];
 
 /// Key names accepted in `[keys]` besides single characters.
@@ -109,6 +110,8 @@ pub struct KeyBindings {
     pub toggle_markdown_preview: Vec<KeyCode>,
     /// Opens the in-TUI theme picker (`T`).
     pub theme_picker: Vec<KeyCode>,
+    /// Opens the actions menu (`?`).
+    pub action_menu: Vec<KeyCode>,
 }
 
 impl Default for KeyBindings {
@@ -147,6 +150,7 @@ impl Default for KeyBindings {
             llm_settings: vec![Char('A')],
             toggle_markdown_preview: vec![Char('m')],
             theme_picker: vec![Char('T')],
+            action_menu: vec![Char('?')],
         }
     }
 }
@@ -688,6 +692,7 @@ impl Config {
                 "llm_settings" => k.llm_settings = keys,
                 "toggle_markdown_preview" => k.toggle_markdown_preview = keys,
                 "theme_picker" => k.theme_picker = keys,
+                "action_menu" => k.action_menu = keys,
                 _ => anyhow::bail!(
                     "unknown action [{action}] (expected one of: {})",
                     ACTIONS.join(", ")
