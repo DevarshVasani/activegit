@@ -47,6 +47,8 @@ pub const ACTIONS: &[&str] = &[
     "toggle_markdown_preview",
     "theme_picker",
     "action_menu",
+    "sync_fetch",
+    "undo",
 ];
 
 /// Key names accepted in `[keys]` besides single characters.
@@ -112,6 +114,10 @@ pub struct KeyBindings {
     pub theme_picker: Vec<KeyCode>,
     /// Opens the actions menu (`?`).
     pub action_menu: Vec<KeyCode>,
+    /// `git fetch` (`f`).
+    pub sync_fetch: Vec<KeyCode>,
+    /// Put back what the last discard threw away (`u`).
+    pub undo: Vec<KeyCode>,
 }
 
 impl Default for KeyBindings {
@@ -151,6 +157,8 @@ impl Default for KeyBindings {
             toggle_markdown_preview: vec![Char('m')],
             theme_picker: vec![Char('T')],
             action_menu: vec![Char('?')],
+            sync_fetch: vec![Char('f')],
+            undo: vec![Char('u')],
         }
     }
 }
@@ -474,11 +482,89 @@ const PALETTES: &[(&str, Palette)] = &[
 pub struct Config {
     pub keys: KeyBindings,
     pub theme: Theme,
-    /// LLM provider for Shift+A commit generation in the commit box.
+    /// LLM provider for Ctrl+G commit generation in the commit box.
     /// `~/.config/activegit/config.toml` `[llm]` section; empty key falls
     /// back to `$OPENAI_API_KEY` / `$ANTHROPIC_API_KEY` / `$GEMINI_API_KEY`
     /// / `$OPENROUTER_API_KEY` / `$LLM_API_KEY` at generation time.
     pub llm: LlmConfig,
+    /// `[ui]` section: interaction preferences.
+    pub ui: UiConfig,
+}
+
+/// `[ui]` options. The defaults suit a first-time user; both can be turned
+/// off by someone who knows the keys and wants the old directness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UiConfig {
+    /// Ask before actions that throw work away (discard, restore hunk,
+    /// delete branch, drop stash).
+    pub confirm_destructive: bool,
+    /// Capture the mouse. `false` leaves it to the terminal, which gives
+    /// back native text selection.
+    pub mouse: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            confirm_destructive: true,
+            mouse: true,
+        }
+    }
+}
+
+/// The `[name]` table of a config document, created if missing.
+fn section<'a>(doc: &'a mut toml_edit::DocumentMut, name: &str) -> &'a mut toml_edit::Item {
+    let item = doc
+        .entry(name)
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    // Something else under that name (a stray scalar): replace it.
+    if !item.is_table_like() {
+        *item = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    item
+}
+
+/// Read the config at `path` as an editable document (keeping comments,
+/// order and formatting), apply `edit`, and write it back atomically.
+fn edit_config(path: &Path, edit: impl FnOnce(&mut toml_edit::DocumentMut)) -> Result<()> {
+    let text = if path.exists() {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read config {}", path.display()))?
+    } else {
+        String::new()
+    };
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .with_context(|| format!("bad config {}", path.display()))?;
+    edit(&mut doc);
+    write_atomic(path, &doc.to_string())
+}
+
+/// Write `text` to `path` by writing a sibling temp file and renaming it
+/// over the target, so a crash mid-write never leaves a truncated file
+/// (a broken config stops the app from starting). Creates parent dirs.
+/// The file is private to the user on Unix: the config can hold an API key.
+pub fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let written = (|| -> std::io::Result<()> {
+        std::fs::write(&tmp, text)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written.with_context(|| format!("cannot write {}", path.display()))
 }
 
 /// App directory name under the XDG config home.
@@ -519,6 +605,7 @@ impl Default for Config {
             keys: KeyBindings::default(),
             theme: Theme::default_theme(),
             llm: LlmConfig::default(),
+            ui: UiConfig::default(),
         }
     }
 }
@@ -548,62 +635,32 @@ impl Config {
         config_dir().map(|d| d.join("config.toml"))
     }
 
-    /// Persist just the `[llm]` section to `path`, preserving every other
-    /// section already in the file (keys, theme). Creates parent dirs.
-    /// Used by the in-TUI setup form (`A` in the file list).
+    /// Persist just the `[llm]` section to `path`, leaving everything else
+    /// in the file as the user wrote it, comments included. Creates parent
+    /// dirs. Used by the in-TUI setup form (`A` in the file list).
     pub fn save_llm_to_path(path: &Path, llm: &LlmConfig) -> Result<()> {
-        let mut doc: toml::Table = if path.exists() {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("cannot read config {}", path.display()))?;
-            toml::from_str(&text).with_context(|| format!("bad config {}", path.display()))?
-        } else {
-            toml::Table::new()
-        };
-        let mut table = toml::Table::new();
-        table.insert(
-            "provider".to_string(),
-            toml::Value::String(llm.provider.clone()),
-        );
-        table.insert("model".to_string(), toml::Value::String(llm.model.clone()));
-        table.insert(
-            "api_key".to_string(),
-            toml::Value::String(llm.api_key.clone()),
-        );
-        if let Some(url) = llm.base_url.as_deref().filter(|u| !u.trim().is_empty()) {
-            table.insert("base_url".to_string(), toml::Value::String(url.to_string()));
-        }
-        doc.insert("llm".to_string(), toml::Value::Table(table));
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
-        }
-        let text = toml::to_string_pretty(&doc).context("cannot serialize config")?;
-        std::fs::write(path, text)
-            .with_context(|| format!("cannot write config {}", path.display()))?;
-        Ok(())
+        edit_config(path, |doc| {
+            let table = section(doc, "llm");
+            table["provider"] = toml_edit::value(llm.provider.as_str());
+            table["model"] = toml_edit::value(llm.model.as_str());
+            table["api_key"] = toml_edit::value(llm.api_key.as_str());
+            match llm.base_url.as_deref().filter(|u| !u.trim().is_empty()) {
+                Some(url) => table["base_url"] = toml_edit::value(url),
+                None => {
+                    if let Some(table) = table.as_table_like_mut() {
+                        table.remove("base_url");
+                    }
+                }
+            }
+        })
     }
 
-    /// Persist `[theme] name` to `path`, keeping every other section of an
-    /// existing config intact (same approach as [`Self::save_llm_to_path`]).
+    /// Persist `[theme] name` to `path`, leaving everything else in the
+    /// file as the user wrote it.
     pub fn save_theme_to_path(path: &Path, name: &str) -> Result<()> {
-        let mut doc: toml::Table = if path.exists() {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("cannot read config {}", path.display()))?;
-            toml::from_str(&text).with_context(|| format!("bad config {}", path.display()))?
-        } else {
-            toml::Table::new()
-        };
-        let mut table = toml::Table::new();
-        table.insert("name".to_string(), toml::Value::String(name.to_string()));
-        doc.insert("theme".to_string(), toml::Value::Table(table));
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
-        }
-        let text = toml::to_string_pretty(&doc).context("cannot serialize config")?;
-        std::fs::write(path, text)
-            .with_context(|| format!("cannot write config {}", path.display()))?;
-        Ok(())
+        edit_config(path, |doc| {
+            section(doc, "theme")["name"] = toml_edit::value(name);
+        })
     }
 
     fn from_toml(text: &str) -> Result<Self> {
@@ -616,6 +673,17 @@ impl Config {
             theme: ThemeSection,
             #[serde(default)]
             llm: LlmSection,
+            #[serde(default)]
+            ui: UiSection,
+        }
+
+        #[derive(Default, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct UiSection {
+            #[serde(default)]
+            confirm_destructive: Option<bool>,
+            #[serde(default)]
+            mouse: Option<bool>,
         }
 
         #[derive(Deserialize)]
@@ -693,6 +761,8 @@ impl Config {
                 "toggle_markdown_preview" => k.toggle_markdown_preview = keys,
                 "theme_picker" => k.theme_picker = keys,
                 "action_menu" => k.action_menu = keys,
+                "sync_fetch" => k.sync_fetch = keys,
+                "undo" => k.undo = keys,
                 _ => anyhow::bail!(
                     "unknown action [{action}] (expected one of: {})",
                     ACTIONS.join(", ")
@@ -701,6 +771,12 @@ impl Config {
         }
         if let Some(name) = file.theme.name {
             cfg.theme = Theme::by_name(&name)?;
+        }
+        if let Some(confirm) = file.ui.confirm_destructive {
+            cfg.ui.confirm_destructive = confirm;
+        }
+        if let Some(mouse) = file.ui.mouse {
+            cfg.ui.mouse = mouse;
         }
         if let Some(provider) = file.llm.provider {
             let p = provider.trim().to_lowercase();
@@ -1105,5 +1181,72 @@ mod tests {
             cfg.theme.border_focused,
             ratatui::style::Color::Rgb(122, 162, 247)
         );
+    }
+
+    #[test]
+    fn ui_section_defaults_on_and_can_be_turned_off() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[theme]\nname = \"nord\"\n").unwrap();
+        let cfg = Config::load_from_path(&path).unwrap();
+        assert_eq!(cfg.ui, UiConfig::default());
+        assert!(cfg.ui.confirm_destructive && cfg.ui.mouse);
+        std::fs::write(&path, "[ui]\nconfirm_destructive = false\nmouse = false\n").unwrap();
+        let cfg = Config::load_from_path(&path).unwrap();
+        assert!(!cfg.ui.confirm_destructive && !cfg.ui.mouse);
+        std::fs::write(&path, "[ui]\nmouze = false\n").unwrap();
+        assert!(Config::load_from_path(&path).is_err());
+    }
+
+    #[test]
+    fn saving_a_setting_keeps_the_users_comments_and_layout() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "# my activegit setup\n\n[keys]\nquit = \"Q\"   # never by accident\n\n[theme]\n# dark at night\nname = \"nord\"\n";
+        std::fs::write(&path, original).unwrap();
+        Config::save_theme_to_path(&path, "gruvbox").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        for kept in [
+            "# my activegit setup",
+            "# never by accident",
+            "# dark at night",
+        ] {
+            assert!(text.contains(kept), "{kept:?} lost:\n{text}");
+        }
+        assert!(text.contains("name = \"gruvbox\""), "{text}");
+        // A new section is appended; the rest is untouched.
+        let llm = LlmConfig {
+            provider: "ollama".into(),
+            model: "llama3".into(),
+            api_key: String::new(),
+            base_url: Some("http://localhost:11434/v1".into()),
+        };
+        Config::save_llm_to_path(&path, &llm).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# never by accident"), "{text}");
+        let cfg = Config::load_from_path(&path).unwrap();
+        assert_eq!(cfg.llm.provider, "ollama");
+        assert_eq!(
+            cfg.llm.base_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
+        assert_eq!(cfg.theme, Theme::by_name("gruvbox").unwrap());
+        // Clearing the base URL removes the key instead of writing "".
+        let llm = LlmConfig {
+            base_url: None,
+            ..llm
+        };
+        Config::save_llm_to_path(&path, &llm).unwrap();
+        assert!(Config::load_from_path(&path)
+            .unwrap()
+            .llm
+            .base_url
+            .is_none());
+        // No temp file left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers.len(), 1, "{leftovers:?}");
     }
 }
