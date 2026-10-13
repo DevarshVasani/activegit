@@ -9,12 +9,14 @@ use crate::diff::FileDiff;
 use crate::error::GitError;
 use crate::log::{CommitInfo, CommitOverview};
 use crate::repo::Repo;
+use crate::stage::Snapshot;
 use crate::stash::StashEntry;
 use crate::status::RepoStatus;
 use crate::sync::SyncStatus;
 use crossbeam_channel::{Receiver, Sender};
+use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// Work requests. All data owned so it can cross threads.
@@ -51,12 +53,40 @@ pub enum AsyncJob {
     UnstageFile {
         path: String,
     },
+    /// Stage a conflicted file to mark it resolved. Refused while the file
+    /// still contains conflict markers.
+    ResolveFile {
+        path: String,
+    },
     DiscardFile {
         path: String,
     },
+    /// Discard several files as one action (a folder), so that one undo
+    /// puts all of them back.
+    DiscardFiles {
+        paths: Vec<String>,
+    },
+    /// Put back what the last discard (file, folder or hunk) threw away.
+    UndoDiscard,
     Commit {
         message: String,
     },
+    /// Replace the last commit, keeping its parent (`git commit --amend`).
+    Amend {
+        message: String,
+    },
+    /// The last commit's message, to prefill the amend box.
+    LoadLastCommitMessage,
+    /// What one commit did to one file, as a diff.
+    LoadCommitDiff {
+        oid: String,
+        path: String,
+    },
+    /// Whether a merge / rebase / cherry-pick / revert is in progress.
+    LoadRepoState,
+    /// Abort or continue that operation.
+    AbortOperation,
+    ContinueOperation,
     ListBranches,
     CreateBranch {
         name: String,
@@ -94,6 +124,15 @@ pub enum AsyncJob {
     },
     /// Pull the current branch (`git pull`, honoring pull.rebase/pull.ff).
     Pull,
+    /// `git fetch --prune`: learn what there is to pull.
+    Fetch,
+    /// Push the current branch to the branch it tracks, whatever its name.
+    PushUpstream,
+    /// `git push --force-with-lease`.
+    PushForce {
+        remote: String,
+        branch: String,
+    },
     /// Point `remote` at `url` (unless already set) and push with `-u`.
     /// The "not yet on GitHub" flow: create the empty remote, then publish.
     Publish {
@@ -151,7 +190,58 @@ pub enum AsyncResult {
         error: String,
     },
     MutationDone,
+    /// Answer to [`AsyncJob::LoadLastCommitMessage`] (`None`: no commits).
+    LastCommitMessage(Option<String>),
+    RepoState(crate::repo::RepoState),
+    /// An undo restored this many files.
+    Undone(usize),
+    /// The job was skipped because a newer job of the same kind was already
+    /// queued behind it (only the newest diff / status / list matters).
+    Superseded,
     Error(GitError),
+}
+
+/// Identifies one submitted job; its result carries the same id, so the
+/// caller can tell which job an [`AsyncResult::Error`] belongs to.
+pub type JobId = u64;
+
+impl AsyncJob {
+    /// Jobs whose result replaces the previous one of the same kind. When a
+    /// newer job for the same slot is already queued, the older one is
+    /// answered with [`AsyncResult::Superseded`] instead of being computed
+    /// (holding `j` over 200 files otherwise loads 200 diffs in turn).
+    fn slot(&self) -> Option<u8> {
+        match self {
+            AsyncJob::LoadDiff { .. }
+            | AsyncJob::LoadFile { .. }
+            | AsyncJob::LoadCommitDiff { .. } => Some(0),
+            AsyncJob::LoadMarkdown { .. } => Some(1),
+            AsyncJob::LoadCommitOverview { .. } => Some(2),
+            AsyncJob::RefreshStatus => Some(3),
+            AsyncJob::ListBranches => Some(4),
+            AsyncJob::ListLog { .. } => Some(5),
+            AsyncJob::ListStash => Some(6),
+            AsyncJob::LoadSync => Some(7),
+            AsyncJob::LoadRepoState => Some(8),
+            _ => None,
+        }
+    }
+
+    /// Jobs that wait on the network. They run on their own thread so a
+    /// slow push or LLM call never holds up status, diffs or staging.
+    fn is_network(&self) -> bool {
+        matches!(
+            self,
+            AsyncJob::Push { .. }
+                | AsyncJob::Pull
+                | AsyncJob::Fetch
+                | AsyncJob::PushUpstream
+                | AsyncJob::PushForce { .. }
+                | AsyncJob::Publish { .. }
+                | AsyncJob::GenerateCommitMessage { .. }
+                | AsyncJob::FetchModels { .. }
+        )
+    }
 }
 
 /// Single-writer job queue: a background thread owns the [`Repo`] and is the
@@ -159,10 +249,11 @@ pub enum AsyncResult {
 /// blocking — the channel is unbounded) and drains [`AsyncResult`]s without
 /// blocking the render loop via [`JobQueue::try_recv`].
 pub struct JobQueue {
-    job_tx: Sender<AsyncJob>,
-    result_rx: Receiver<AsyncResult>,
+    job_tx: Sender<(JobId, AsyncJob)>,
+    result_rx: Receiver<(JobId, AsyncResult)>,
     /// Jobs submitted whose result has not been received yet.
     pending: AtomicUsize,
+    next_id: AtomicU64,
 }
 
 impl JobQueue {
@@ -174,23 +265,31 @@ impl JobQueue {
 
     /// Move an already-opened [`Repo`] into the worker thread.
     pub fn spawn_from_repo(repo: Repo) -> Self {
-        let (job_tx, job_rx) = crossbeam_channel::unbounded::<AsyncJob>();
-        let (result_tx, result_rx) = crossbeam_channel::unbounded::<AsyncResult>();
+        let (job_tx, job_rx) = crossbeam_channel::unbounded::<(JobId, AsyncJob)>();
+        let (result_tx, result_rx) = crossbeam_channel::unbounded::<(JobId, AsyncResult)>();
         std::thread::spawn(move || worker_loop(repo, job_rx, result_tx));
         Self {
             job_tx,
             result_rx,
             pending: AtomicUsize::new(0),
+            next_id: AtomicU64::new(1),
         }
     }
 
     /// Submit a job without blocking. Errors only if the worker is gone.
     pub fn submit(&self, job: AsyncJob) -> Result<(), GitError> {
+        self.submit_tagged(job).map(|_| ())
+    }
+
+    /// Like [`Self::submit`], returning the id the job's result will carry
+    /// (see [`Self::try_recv_tagged`]).
+    pub fn submit_tagged(&self, job: AsyncJob) -> Result<JobId, GitError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.job_tx
-            .send(job)
+            .send((id, job))
             .map_err(|_| GitError::ChannelDisconnected)?;
         self.pending.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Ok(id)
     }
 
     /// Whether any submitted job is still waiting for its result. The
@@ -207,14 +306,19 @@ impl JobQueue {
 
     /// Non-blocking drain for the render loop.
     pub fn try_recv(&self) -> Option<AsyncResult> {
-        let result = self.result_rx.try_recv().ok()?;
+        self.try_recv_tagged().map(|(_, result)| result)
+    }
+
+    /// Non-blocking drain that also says which job each result answers.
+    pub fn try_recv_tagged(&self) -> Option<(JobId, AsyncResult)> {
+        let tagged = self.result_rx.try_recv().ok()?;
         self.received();
-        Some(result)
+        Some(tagged)
     }
 
     /// Blocking receive (tests / simple drivers).
     pub fn recv(&self) -> Result<AsyncResult, GitError> {
-        let result = self
+        let (_, result) = self
             .result_rx
             .recv()
             .map_err(|_| GitError::ChannelDisconnected)?;
@@ -224,23 +328,81 @@ impl JobQueue {
 
     /// Blocking receive with timeout (tests).
     pub fn recv_timeout(&self, timeout: Duration) -> Option<AsyncResult> {
-        let result = self.result_rx.recv_timeout(timeout).ok()?;
+        let (_, result) = self.result_rx.recv_timeout(timeout).ok()?;
         self.received();
         Some(result)
     }
 }
 
-fn worker_loop(mut repo: Repo, jobs: Receiver<AsyncJob>, results: Sender<AsyncResult>) {
-    while let Ok(job) = jobs.recv() {
-        let result = execute(&mut repo, job);
-        if results.send(result).is_err() {
-            // TUI is gone; shut down.
+fn worker_loop(
+    mut repo: Repo,
+    jobs: Receiver<(JobId, AsyncJob)>,
+    results: Sender<(JobId, AsyncResult)>,
+) {
+    // Everything already queued, so a job can see what is waiting behind it.
+    let mut backlog: VecDeque<(JobId, AsyncJob)> = VecDeque::new();
+    // What the last discard threw away, for `UndoDiscard`.
+    let mut undo: Vec<Snapshot> = Vec::new();
+    loop {
+        if backlog.is_empty() {
+            match jobs.recv() {
+                Ok(job) => backlog.push_back(job),
+                // TUI is gone; shut down.
+                Err(_) => break,
+            }
+        }
+        backlog.extend(jobs.try_iter());
+        let Some((id, job)) = backlog.pop_front() else {
+            continue;
+        };
+        let superseded = job
+            .slot()
+            .is_some_and(|slot| backlog.iter().any(|(_, later)| later.slot() == Some(slot)));
+        if superseded {
+            if results.send((id, AsyncResult::Superseded)).is_err() {
+                break;
+            }
+            continue;
+        }
+        if job.is_network() {
+            if let Some(workdir) = repo.workdir() {
+                // Its own repo handle: the worker keeps serving local jobs.
+                let results = results.clone();
+                std::thread::spawn(move || {
+                    let result = match Repo::open(&workdir) {
+                        // Network jobs never discard: no undo state needed.
+                        Ok(mut repo) => execute(&mut repo, job, &mut Vec::new()),
+                        Err(e) => AsyncResult::Error(e),
+                    };
+                    let _ = results.send((id, result));
+                });
+                continue;
+            }
+        }
+        let result = execute(&mut repo, job, &mut undo);
+        if results.send((id, result)).is_err() {
             break;
         }
     }
 }
 
-fn execute(repo: &mut Repo, job: AsyncJob) -> AsyncResult {
+/// Snapshot `paths`, then discard them one by one. Whatever was discarded
+/// before a failure is still recorded, so it can be undone.
+fn discard_with_undo(repo: &Repo, paths: &[String], undo: &mut Vec<Snapshot>) -> AsyncResult {
+    undo.clear();
+    for path in paths {
+        // A path that cannot be snapshotted (a symlink, say) is still
+        // discarded; it just cannot be brought back.
+        let snapshot = crate::stage::snapshot_path(repo.inner(), path).ok();
+        if let Err(e) = repo.discard_file(path) {
+            return AsyncResult::Error(e);
+        }
+        undo.extend(snapshot);
+    }
+    AsyncResult::MutationDone
+}
+
+fn execute(repo: &mut Repo, job: AsyncJob, undo: &mut Vec<Snapshot>) -> AsyncResult {
     match job {
         AsyncJob::RefreshStatus => match repo.status() {
             Ok(st) => AsyncResult::Status(st),
@@ -273,10 +435,81 @@ fn execute(repo: &mut Repo, job: AsyncJob) -> AsyncResult {
             Ok(()) => AsyncResult::MutationDone,
             Err(e) => AsyncResult::Error(e),
         },
-        AsyncJob::DiscardFile { path } => match repo.discard_file(&path) {
-            Ok(()) => AsyncResult::MutationDone,
+        AsyncJob::ResolveFile { path } => {
+            let full = match repo.workdir() {
+                Some(root) => root.join(&path),
+                None => return AsyncResult::Error(GitError::NotARepo(path)),
+            };
+            // A file deleted to resolve the conflict has no markers.
+            let unresolved = std::fs::read(&full).is_ok_and(|bytes| {
+                bytes
+                    .split(|b| *b == b'\n')
+                    .any(|line| line.starts_with(b"<<<<<<< ") || line.starts_with(b">>>>>>> "))
+            });
+            if unresolved {
+                return AsyncResult::Error(GitError::HunkStaging(format!(
+                    "{path} still has conflict markers (<<<<<<< / >>>>>>>): \
+                     edit them out, then stage it to mark it resolved"
+                )));
+            }
+            match repo.stage_file(&path) {
+                Ok(()) => AsyncResult::MutationDone,
+                Err(e) => AsyncResult::Error(e),
+            }
+        }
+        AsyncJob::DiscardFile { path } => discard_with_undo(repo, &[path], undo),
+        AsyncJob::DiscardFiles { paths } => discard_with_undo(repo, &paths, undo),
+        AsyncJob::UndoDiscard => {
+            if undo.is_empty() {
+                return AsyncResult::Error(GitError::Discard(
+                    "nothing to undo: no discard to put back".into(),
+                ));
+            }
+            for snapshot in undo.iter() {
+                if let Err(e) = crate::stage::restore_snapshot(repo.inner(), snapshot) {
+                    return AsyncResult::Error(e);
+                }
+            }
+            let restored = undo.len();
+            undo.clear();
+            AsyncResult::Undone(restored)
+        }
+        AsyncJob::Amend { message } => match crate::commit::amend(repo.inner(), &message) {
+            Ok(_) => AsyncResult::MutationDone,
             Err(e) => AsyncResult::Error(e),
         },
+        AsyncJob::LoadLastCommitMessage => {
+            AsyncResult::LastCommitMessage(crate::commit::last_commit_message(repo.inner()))
+        }
+        AsyncJob::LoadCommitDiff { oid, path } => {
+            match crate::diff::commit_file_diff(repo.inner(), &oid, &path) {
+                Ok(d) => AsyncResult::Diff(d),
+                Err(e) => AsyncResult::Error(e),
+            }
+        }
+        AsyncJob::LoadRepoState => AsyncResult::RepoState(crate::repo::repo_state(repo.inner())),
+        AsyncJob::AbortOperation => match crate::sync::abort_operation(repo.inner()) {
+            Ok(_) => AsyncResult::MutationDone,
+            Err(e) => AsyncResult::Error(e),
+        },
+        AsyncJob::ContinueOperation => match crate::sync::continue_operation(repo.inner()) {
+            Ok(_) => AsyncResult::MutationDone,
+            Err(e) => AsyncResult::Error(e),
+        },
+        AsyncJob::Fetch => match crate::sync::fetch(repo.inner()) {
+            Ok(_) => AsyncResult::MutationDone,
+            Err(e) => AsyncResult::Error(e),
+        },
+        AsyncJob::PushUpstream => match crate::sync::push_to_upstream(repo.inner()) {
+            Ok(_) => AsyncResult::MutationDone,
+            Err(e) => AsyncResult::Error(e),
+        },
+        AsyncJob::PushForce { remote, branch } => {
+            match crate::sync::push_force_with_lease(repo.inner(), &remote, &branch) {
+                Ok(_) => AsyncResult::MutationDone,
+                Err(e) => AsyncResult::Error(e),
+            }
+        }
         AsyncJob::StageHunk { path, hunk_index } => match repo.stage_hunk(&path, hunk_index) {
             Ok(()) => AsyncResult::MutationDone,
             Err(e) => AsyncResult::Error(e),
@@ -285,10 +518,17 @@ fn execute(repo: &mut Repo, job: AsyncJob) -> AsyncResult {
             path,
             hunk_index,
             staged,
-        } => match repo.discard_hunk(&path, hunk_index, staged) {
-            Ok(()) => AsyncResult::MutationDone,
-            Err(e) => AsyncResult::Error(e),
-        },
+        } => {
+            let snapshot = crate::stage::snapshot_path(repo.inner(), &path).ok();
+            match repo.discard_hunk(&path, hunk_index, staged) {
+                Ok(()) => {
+                    undo.clear();
+                    undo.extend(snapshot);
+                    AsyncResult::MutationDone
+                }
+                Err(e) => AsyncResult::Error(e),
+            }
+        }
         AsyncJob::Commit { message } => match repo.commit(&message) {
             Ok(_) => AsyncResult::MutationDone,
             Err(e) => AsyncResult::Error(e),
@@ -679,6 +919,7 @@ mod tests {
         drop(repo);
         let queue = JobQueue::spawn(path).unwrap();
         // Submit three jobs back-to-back; results must arrive in order.
+        // (Three different kinds: same-kind jobs may be coalesced.)
         queue.submit(AsyncJob::RefreshStatus).unwrap();
         queue
             .submit(AsyncJob::LoadDiff {
@@ -686,13 +927,110 @@ mod tests {
                 staged: false,
             })
             .unwrap();
-        queue.submit(AsyncJob::RefreshStatus).unwrap();
+        queue.submit(AsyncJob::ListBranches).unwrap();
         let first = recv_next(&queue);
         let second = recv_next(&queue);
         let third = recv_next(&queue);
         assert!(matches!(first, AsyncResult::Status(_)), "got {first:?}");
         assert!(matches!(second, AsyncResult::Diff(_)), "got {second:?}");
-        assert!(matches!(third, AsyncResult::Status(_)), "got {third:?}");
+        assert!(matches!(third, AsyncResult::Branches(_)), "got {third:?}");
+    }
+
+    #[test]
+    fn queued_loads_of_the_same_kind_collapse_to_the_newest() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        testutil::commit_file(&repo, "b.txt", "b\n", "init");
+        testutil::dirty_file(&repo, "a.txt", "more\n");
+        testutil::dirty_file(&repo, "b.txt", "more\n");
+        let path = repo.workdir().unwrap().to_path_buf();
+        drop(repo);
+        let queue = JobQueue::spawn(path).unwrap();
+        // Holding `j` over a long list: only the last file matters.
+        const N: usize = 60;
+        for i in 0..N {
+            let path = if i == N - 1 { "b.txt" } else { "a.txt" };
+            queue
+                .submit(AsyncJob::LoadDiff {
+                    path: path.into(),
+                    staged: false,
+                })
+                .unwrap();
+        }
+        let results: Vec<AsyncResult> = (0..N).map(|_| recv_next(&queue)).collect();
+        assert!(!queue.has_pending(), "every job still gets one answer");
+        // The newest is always computed, never skipped.
+        match results.last().unwrap() {
+            AsyncResult::Diff(d) => assert_eq!(d.path, "b.txt"),
+            other => panic!("last result must be the newest diff, got {other:?}"),
+        }
+        for r in &results {
+            assert!(
+                matches!(r, AsyncResult::Diff(_) | AsyncResult::Superseded),
+                "got {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mutation_between_two_loads_is_never_skipped() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        testutil::dirty_file(&repo, "a.txt", "more\n");
+        let path = repo.workdir().unwrap().to_path_buf();
+        drop(repo);
+        let queue = JobQueue::spawn(path).unwrap();
+        queue.submit(AsyncJob::RefreshStatus).unwrap();
+        queue
+            .submit(AsyncJob::StageFile {
+                path: "a.txt".into(),
+            })
+            .unwrap();
+        queue.submit(AsyncJob::RefreshStatus).unwrap();
+        let results: Vec<AsyncResult> = (0..3).map(|_| recv_next(&queue)).collect();
+        assert!(
+            matches!(results[1], AsyncResult::MutationDone),
+            "{results:?}"
+        );
+        // The status after the mutation reflects it.
+        match &results[2] {
+            AsyncResult::Status(st) => {
+                let entry = st.files.iter().find(|e| e.path == "a.txt").unwrap();
+                assert_eq!(entry.state, FileState::Staged);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn results_carry_the_id_of_the_job_that_produced_them() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        let path = repo.workdir().unwrap().to_path_buf();
+        drop(repo);
+        let queue = JobQueue::spawn(path).unwrap();
+        let status = queue.submit_tagged(AsyncJob::RefreshStatus).unwrap();
+        let bad = queue
+            .submit_tagged(AsyncJob::StageHunk {
+                path: "a.txt".into(),
+                hunk_index: 9,
+            })
+            .unwrap();
+        assert_ne!(status, bad);
+        let mut seen = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while seen.len() < 2 {
+            if let Some(tagged) = queue.try_recv_tagged() {
+                seen.push(tagged);
+            }
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let error_id = seen
+            .iter()
+            .find(|(_, r)| matches!(r, AsyncResult::Error(_)))
+            .map(|(id, _)| *id);
+        assert_eq!(error_id, Some(bad), "the error belongs to the hunk job");
     }
 
     #[test]
@@ -977,5 +1315,152 @@ mod tests {
         assert_eq!(st.upstream.as_deref(), Some("origin/main"));
         let remote = git2::Repository::open_bare(&origin_path).unwrap();
         assert!(remote.find_reference("refs/heads/main").is_ok());
+    }
+
+    #[test]
+    fn undo_puts_back_a_discarded_file_a_folder_and_a_hunk() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        testutil::commit_file(&repo, "src/b.txt", "b\n", "init");
+        let root = repo.workdir().unwrap().to_path_buf();
+        std::fs::write(root.join("a.txt"), "a changed\n").unwrap();
+        std::fs::write(root.join("src/b.txt"), "b changed\n").unwrap();
+        std::fs::write(root.join("src/new.txt"), "brand new\n").unwrap();
+        drop(repo);
+        let queue = JobQueue::spawn(&root).unwrap();
+        let read = |name: &str| std::fs::read_to_string(root.join(name)).ok();
+
+        // Nothing to undo yet.
+        queue.submit(AsyncJob::UndoDiscard).unwrap();
+        assert!(matches!(recv_next(&queue), AsyncResult::Error(_)));
+
+        // A folder: tracked change and an untracked file, in one job.
+        queue
+            .submit(AsyncJob::DiscardFiles {
+                paths: vec!["src/b.txt".into(), "src/new.txt".into()],
+            })
+            .unwrap();
+        assert!(matches!(recv_next(&queue), AsyncResult::MutationDone));
+        assert_eq!(read("src/b.txt").as_deref(), Some("b\n"));
+        assert_eq!(read("src/new.txt"), None, "untracked file deleted");
+        queue.submit(AsyncJob::UndoDiscard).unwrap();
+        match recv_next(&queue) {
+            AsyncResult::Undone(n) => assert_eq!(n, 2),
+            other => panic!("got {other:?}"),
+        }
+        assert_eq!(read("src/b.txt").as_deref(), Some("b changed\n"));
+        assert_eq!(read("src/new.txt").as_deref(), Some("brand new\n"));
+
+        // Undo is one level: it is spent now.
+        queue.submit(AsyncJob::UndoDiscard).unwrap();
+        assert!(matches!(recv_next(&queue), AsyncResult::Error(_)));
+
+        // A single file.
+        queue
+            .submit(AsyncJob::DiscardFile {
+                path: "a.txt".into(),
+            })
+            .unwrap();
+        assert!(matches!(recv_next(&queue), AsyncResult::MutationDone));
+        assert_eq!(read("a.txt").as_deref(), Some("a\n"));
+        queue.submit(AsyncJob::UndoDiscard).unwrap();
+        assert!(matches!(recv_next(&queue), AsyncResult::Undone(1)));
+        assert_eq!(read("a.txt").as_deref(), Some("a changed\n"));
+
+        // A hunk.
+        queue
+            .submit(AsyncJob::DiscardHunk {
+                path: "a.txt".into(),
+                hunk_index: 0,
+                staged: false,
+            })
+            .unwrap();
+        assert!(matches!(recv_next(&queue), AsyncResult::MutationDone));
+        assert_eq!(read("a.txt").as_deref(), Some("a\n"));
+        queue.submit(AsyncJob::UndoDiscard).unwrap();
+        assert!(matches!(recv_next(&queue), AsyncResult::Undone(1)));
+        assert_eq!(read("a.txt").as_deref(), Some("a changed\n"));
+    }
+
+    #[test]
+    fn commit_diff_amend_and_repo_state_via_queue() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "one\n", "first");
+        testutil::commit_file(&repo, "a.txt", "one\ntwo\n", "second");
+        let oid = repo.head().unwrap().target().unwrap().to_string();
+        let root = repo.workdir().unwrap().to_path_buf();
+        drop(repo);
+        let queue = JobQueue::spawn(&root).unwrap();
+
+        queue
+            .submit(AsyncJob::LoadCommitDiff {
+                oid,
+                path: "a.txt".into(),
+            })
+            .unwrap();
+        let diff = expect_diff(recv_next(&queue));
+        assert_eq!(diff.path, "a.txt");
+        assert_eq!(diff.hunks.len(), 1);
+
+        queue.submit(AsyncJob::LoadRepoState).unwrap();
+        assert!(matches!(
+            recv_next(&queue),
+            AsyncResult::RepoState(crate::repo::RepoState::Clean)
+        ));
+
+        queue.submit(AsyncJob::LoadLastCommitMessage).unwrap();
+        match recv_next(&queue) {
+            AsyncResult::LastCommitMessage(Some(msg)) => assert_eq!(msg.trim(), "second"),
+            other => panic!("got {other:?}"),
+        }
+        queue
+            .submit(AsyncJob::Amend {
+                message: "second, reworded".into(),
+            })
+            .unwrap();
+        assert!(matches!(recv_next(&queue), AsyncResult::MutationDone));
+        queue.submit(AsyncJob::LoadLastCommitMessage).unwrap();
+        match recv_next(&queue) {
+            AsyncResult::LastCommitMessage(Some(msg)) => {
+                assert_eq!(msg.trim(), "second, reworded")
+            }
+            other => panic!("got {other:?}"),
+        }
+        // Nothing in progress: abort has nothing to abort.
+        queue.submit(AsyncJob::AbortOperation).unwrap();
+        assert!(matches!(recv_next(&queue), AsyncResult::Error(_)));
+    }
+
+    #[test]
+    fn a_conflicted_file_is_resolved_only_once_its_markers_are_gone() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "base\n", "init");
+        let root = repo.workdir().unwrap().to_path_buf();
+        std::fs::write(
+            root.join("a.txt"),
+            "<<<<<<< HEAD\nmine\n=======\ntheirs\n>>>>>>> other\n",
+        )
+        .unwrap();
+        drop(repo);
+        let queue = JobQueue::spawn(&root).unwrap();
+        queue
+            .submit(AsyncJob::ResolveFile {
+                path: "a.txt".into(),
+            })
+            .unwrap();
+        match recv_next(&queue) {
+            AsyncResult::Error(e) => assert!(e.to_string().contains("conflict markers"), "{e}"),
+            other => panic!("got {other:?}"),
+        }
+        std::fs::write(root.join("a.txt"), "mine and theirs\n").unwrap();
+        queue
+            .submit(AsyncJob::ResolveFile {
+                path: "a.txt".into(),
+            })
+            .unwrap();
+        assert!(matches!(recv_next(&queue), AsyncResult::MutationDone));
+        queue.submit(AsyncJob::RefreshStatus).unwrap();
+        let st = expect_status(recv_next(&queue));
+        assert_eq!(st.files[0].state, FileState::Staged);
     }
 }

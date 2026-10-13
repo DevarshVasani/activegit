@@ -22,6 +22,8 @@ pub enum MouseAction {
     ScrollUp(u16, u16),
     /// Wheel-down at screen cell `(col, row)`.
     ScrollDown(u16, u16),
+    /// Right-press at screen cell `(col, row)`: context menu.
+    RightDown(u16, u16),
 }
 
 pub struct Workspace {
@@ -42,7 +44,18 @@ pub struct Workspace {
     /// Where to persist the open-project session. `None` disables
     /// persistence (tests); the binary sets it to `Session::default_path()`.
     session_path: Option<PathBuf>,
+    /// When Backspace last emptied the browser filter. A held Backspace
+    /// must stop there instead of carrying on up the directory tree.
+    filter_emptied: Option<std::time::Instant>,
 }
+
+/// How long after Backspace empties the browser filter the next Backspace
+/// is still "the same hold" (and so does not go up a directory).
+const FILTER_HOLD: std::time::Duration = if cfg!(test) {
+    std::time::Duration::ZERO
+} else {
+    std::time::Duration::from_millis(400)
+};
 
 impl Workspace {
     pub fn open(paths: Vec<PathBuf>, config: Config) -> Result<Self> {
@@ -63,6 +76,7 @@ impl Workspace {
             bar_y: std::cell::Cell::new(0),
             show_welcome: false,
             session_path: None,
+            filter_emptied: None,
         };
         for input in &inputs {
             let root = Repo::discover(input)
@@ -142,6 +156,15 @@ impl Workspace {
         if !self.apps.is_empty() {
             self.current = index.min(self.apps.len() - 1);
             self.save_session();
+            self.entered_tab();
+        }
+    }
+
+    /// A tab that was in the background may be out of date: nothing
+    /// refreshed it while another project was in front.
+    fn entered_tab(&mut self) {
+        if matches!(self.current().mode(), Mode::Normal | Mode::FullDiff) {
+            self.current_mut().refresh_quietly();
         }
     }
 
@@ -265,11 +288,8 @@ impl Workspace {
     }
 
     pub fn goto_parent(&mut self) {
-        let parent = self
-            .current()
-            .open_browser()
-            .and_then(|b| b.cwd.parent().map(|p| p.to_path_buf()));
-        // No parent means the filesystem root: nothing to do.
+        let parent = self.current().open_browser().and_then(|b| b.parent());
+        // No parent means the places level: nothing above it.
         if let Some(parent) = parent {
             if let Some(b) = self.current_mut().open_browser_mut() {
                 b.goto(parent);
@@ -279,10 +299,7 @@ impl Workspace {
 
     /// Go up one level regardless of the highlighted row (`←`/`h`).
     pub fn browser_up(&mut self) {
-        let parent = self
-            .current()
-            .open_browser()
-            .and_then(|b| b.cwd.parent().map(|p| p.to_path_buf()));
+        let parent = self.current().open_browser().and_then(|b| b.parent());
         if let Some(parent) = parent {
             if let Some(b) = self.current_mut().open_browser_mut() {
                 b.goto(parent);
@@ -455,8 +472,17 @@ impl Workspace {
         }
         // The project browser needs workspace-level opens.
         if self.current().mode() == Mode::OpenProject {
-            if let MouseAction::Down(_, row) = action {
-                self.click_browser(row);
+            match action {
+                MouseAction::Down(col, row) => {
+                    if self.current_mut().click_popup(col, row) {
+                        self.replay_click_keys();
+                    } else {
+                        self.click_browser(col, row);
+                    }
+                }
+                MouseAction::ScrollUp(..) => self.on_key_browser(KeyCode::Up),
+                MouseAction::ScrollDown(..) => self.on_key_browser(KeyCode::Down),
+                _ => {}
             }
             return;
         }
@@ -466,18 +492,21 @@ impl Workspace {
             MouseAction::Up => self.current_mut().on_mouse_up(),
             MouseAction::ScrollUp(col, row) => self.current_mut().on_wheel(col, row, true),
             MouseAction::ScrollDown(col, row) => self.current_mut().on_wheel(col, row, false),
+            MouseAction::RightDown(col, row) => self.current_mut().on_right_click(col, row),
         }
+        self.replay_click_keys();
         self.sync_theme();
         self.run_menu_request();
     }
 
     /// Click a project-browser row: select it, or activate it when it is
     /// already selected (mouse double-click without a timer).
-    fn click_browser(&mut self, row: u16) {
+    fn click_browser(&mut self, col: u16, row: u16) {
+        let double = self.current_mut().note_click(col, row);
         let Some(idx) = self.current().browser_hit_at(row) else {
             return;
         };
-        if idx == self.current().browser_selected_index() {
+        if idx == self.current().browser_selected_index() && double {
             self.open_selected();
         } else {
             self.current_mut().set_browser_selected(idx);
@@ -488,6 +517,7 @@ impl Workspace {
         if !self.apps.is_empty() {
             self.current = (self.current + 1) % self.apps.len();
             self.save_session();
+            self.entered_tab();
         }
     }
 
@@ -495,6 +525,7 @@ impl Workspace {
         if !self.apps.is_empty() {
             self.current = (self.current + self.apps.len() - 1) % self.apps.len();
             self.save_session();
+            self.entered_tab();
         }
     }
 
@@ -523,8 +554,8 @@ impl Workspace {
         self.on_key_with_modifiers(key, shift);
     }
 
-    /// Modifier-aware dispatch: Shift+A inside the commit box generates a
-    /// commit message; everywhere else behaves like [`Self::on_key`].
+    /// Modifier-aware dispatch (Shift matters for Shift+arrows); keys
+    /// pressed with Ctrl or Alt arrive through [`Self::on_chord`].
     pub fn on_key_with_modifiers(&mut self, key: KeyCode, shift_held: bool) {
         // The welcome overlay owns every key until dismissed.
         if self.show_welcome {
@@ -552,10 +583,11 @@ impl Workspace {
             return;
         }
         // `q` closes the current project, `Q` (Shift+q) quits the whole app.
-        // Only in Normal/FullDiff: text modals and the finder treat `q` as
-        // literal input. `quit` wins when both actions share a key so a
+        // Only in the main view: text modals and the finder treat `q` as
+        // literal input, and in the fullscreen diff `q` closes the diff.
+        // `quit` wins when both actions share a key so a
         // `quit = ["q", "Q"]` override still quits everything.
-        if matches!(self.current().mode(), Mode::Normal | Mode::FullDiff)
+        if self.current().mode() == Mode::Normal
             && !self.keys.quit.contains(&key)
             && self.keys.project_close.contains(&key)
         {
@@ -602,6 +634,64 @@ impl Workspace {
         }
     }
 
+    /// A key pressed with Ctrl or Alt (see [`crate::input::Chord`]).
+    pub fn on_chord(&mut self, chord: crate::input::Chord) {
+        use crate::input::Chord;
+        if self.show_welcome {
+            return;
+        }
+        if matches!(self.current().mode(), Mode::OpenProject | Mode::ConfirmInit) {
+            // The browser is workspace-owned: only the list movement
+            // shortcuts mean anything there.
+            match chord {
+                Chord::Ctrl('n') => self.on_key_with_modifiers(KeyCode::Down, false),
+                Chord::Ctrl('p') => self.on_key_with_modifiers(KeyCode::Up, false),
+                _ => {}
+            }
+            return;
+        }
+        self.current_mut().on_chord(chord);
+        self.sync_theme();
+        self.run_menu_request();
+    }
+
+    /// Pasted text goes to the open text box as text, never as keys.
+    pub fn on_paste(&mut self, text: &str) {
+        if self.show_welcome {
+            return;
+        }
+        match self.current().mode() {
+            Mode::OpenProject => {
+                // Filter or path line: one line of printable characters.
+                for c in text.chars().filter(|c| !c.is_control()) {
+                    self.on_key_browser(KeyCode::Char(c));
+                }
+            }
+            Mode::ConfirmInit => {}
+            _ => self.current_mut().on_paste(text),
+        }
+    }
+
+    /// The terminal got focus back: files, branches or the index may have
+    /// changed while the user was in their editor or another shell.
+    pub fn on_focus_gained(&mut self) {
+        if matches!(self.current().mode(), Mode::Normal | Mode::FullDiff) {
+            self.current_mut().refresh_quietly();
+        }
+    }
+
+    /// `[ui] mouse`.
+    pub fn mouse_enabled(&self) -> bool {
+        self.config.ui.mouse
+    }
+
+    /// Replay keys that clicks produced for the modes handled here.
+    fn replay_click_keys(&mut self) {
+        for key in self.current_mut().take_workspace_keys() {
+            self.on_key_with_modifiers(key, false);
+        }
+    }
+
     /// The theme picker runs inside one project tab but the theme is
     /// global: copy the current tab's theme to every tab and to the config
     /// that new tabs are opened with.
@@ -611,6 +701,15 @@ impl Workspace {
             self.config.theme = theme;
             for app in &mut self.apps {
                 app.set_theme(theme);
+            }
+        }
+        // Same for LLM settings saved from the setup form: every tab, and
+        // tabs opened later, use them without a restart.
+        if self.config.llm != *self.current().llm() {
+            self.config.llm = self.current().llm().clone();
+            let llm = self.config.llm.clone();
+            for app in &mut self.apps {
+                app.set_llm(llm.clone());
             }
         }
     }
@@ -649,16 +748,27 @@ impl Workspace {
                     b.push_filter_char(c);
                 }
             }
-            // Edit the query; an empty query + Backspace goes up a level.
+            // Edit the query; an empty query + Backspace goes up a level,
+            // unless this is still the hold that emptied the query.
             KeyCode::Backspace => {
                 let empty = self
                     .current()
                     .open_browser()
                     .is_some_and(|b| b.filter.is_empty());
                 if empty {
-                    self.browser_up();
+                    let same_hold = self
+                        .filter_emptied
+                        .is_some_and(|t| t.elapsed() < FILTER_HOLD);
+                    if same_hold {
+                        self.filter_emptied = Some(std::time::Instant::now());
+                    } else {
+                        self.browser_up();
+                    }
                 } else if let Some(b) = self.current_mut().open_browser_mut() {
                     b.pop_filter_char();
+                    if b.filter.is_empty() {
+                        self.filter_emptied = Some(std::time::Instant::now());
+                    }
                 }
             }
             KeyCode::Up => {
@@ -1305,7 +1415,7 @@ mod tests {
     }
 
     #[test]
-    fn q_in_fullscreen_closes_project_and_shift_q_quits() {
+    fn q_in_fullscreen_closes_the_diff_and_shift_q_quits() {
         let a = init_repo_with_file("a", "a.txt", "a\n");
         let b = init_repo_with_file("b", "b.txt", "b\n");
         let mut ws = Workspace::open(
@@ -1329,7 +1439,16 @@ mod tests {
         ws.on_key(KeyCode::Enter);
         assert_eq!(ws.current().mode(), Mode::FullDiff);
         ws.on_key(KeyCode::Char('q'));
-        assert_eq!(ws.len(), 1, "q fullscreen must close the project");
+        assert_eq!(
+            ws.len(),
+            2,
+            "q in the diff closes the diff, not the project"
+        );
+        assert_eq!(ws.current().mode(), Mode::Normal);
+        assert!(!ws.should_quit());
+        // From the main view it closes the project as before.
+        ws.on_key(KeyCode::Char('q'));
+        assert_eq!(ws.len(), 1);
         assert!(!ws.should_quit());
 
         // Reopen to two tabs and verify Q quits from fullscreen.
@@ -1540,5 +1659,88 @@ mod tests {
         assert_eq!(ws.apps.len(), 2);
         assert_eq!(ws.current().mode(), Mode::ActionMenu);
         assert_eq!(ws.current().draft(), "q]o");
+    }
+
+    #[test]
+    fn paste_and_chords_in_the_browser_are_text_or_nothing() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ws.on_key(KeyCode::Char('o'));
+        assert_eq!(ws.current().mode(), Mode::OpenProject);
+        ws.on_paste("zz\nq");
+        assert_eq!(ws.current().mode(), Mode::OpenProject);
+        assert_eq!(ws.current().open_browser().unwrap().filter, "zzq");
+        ws.on_chord(crate::input::Chord::Ctrl('d'));
+        ws.on_chord(crate::input::Chord::Ctrl('q'));
+        assert_eq!(ws.current().mode(), Mode::OpenProject);
+        assert!(!ws.should_quit());
+    }
+
+    #[test]
+    fn paste_in_the_main_view_runs_nothing() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ws.on_paste("qQo]\n");
+        assert_eq!(ws.len(), 1);
+        assert!(!ws.should_quit());
+        assert_eq!(ws.current().mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn llm_settings_saved_in_one_tab_reach_the_others() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let b = init_repo_with_file("b", "b.txt", "b\n");
+        let mut ws = Workspace::open(
+            vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            Config::default(),
+        )
+        .unwrap();
+        let mut llm = ws.current().llm().clone();
+        llm.provider = "ollama".into();
+        llm.model = "llama3".into();
+        ws.current_mut().set_llm(llm.clone());
+        // Any key runs the sync, as saving the form does.
+        ws.on_key(KeyCode::Esc);
+        assert!(ws.apps.iter().all(|app| *app.llm() == llm));
+        assert_eq!(ws.config.llm, llm, "tabs opened later get it too");
+    }
+    #[test]
+    fn browser_climbs_past_the_drive_to_the_places_and_into_another_one() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ws.on_key(KeyCode::Char('o'));
+        // Up and up: past the top of the drive is the list of places.
+        for _ in 0..64 {
+            ws.on_key(KeyCode::Left);
+        }
+        let b = ws.current().open_browser().unwrap();
+        assert!(b.at_places(), "stuck at {}", b.cwd.display());
+        assert!(b.error.is_none());
+        // No `.` / `..` rows up here, and nothing further up.
+        assert_eq!(b.row_count(), b.view.len());
+        assert!(!b.view.is_empty());
+        assert!(b.parent().is_none());
+        // Drives (or `/`) come first, as in This PC, and can be entered.
+        let last = 0;
+        let drive = std::path::PathBuf::from(&b.view[last].name);
+        assert!(b.view.iter().any(|e| e.note == "home folder"));
+        assert!(
+            drive.parent().is_none(),
+            "{} is not a root",
+            drive.display()
+        );
+        ws.current_mut().set_browser_selected(last);
+        ws.on_key(KeyCode::Enter);
+        assert_eq!(ws.current().mode(), Mode::OpenProject);
+        let b = ws.current().open_browser().unwrap();
+        assert_eq!(b.cwd, drive);
+        // `..` from the top of the drive leads back to the places.
+        ws.current_mut().set_browser_selected(1);
+        ws.on_key(KeyCode::Enter);
+        assert!(ws.current().open_browser().unwrap().at_places());
+        // Typing filters the places too.
+        ws.on_key(KeyCode::Char('~'));
+        ws.on_key(KeyCode::Char('~'));
+        assert!(ws.current().open_browser().unwrap().view.is_empty());
     }
 }
